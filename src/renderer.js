@@ -1,7 +1,7 @@
-import { WEAPONS } from '../data/catalog.js';
+import { WEAPONS } from '../data/catalog.js?v=1.4.0';
 
 const TAU = Math.PI * 2;
-const COLORS = { ink: '#061522', ocean: '#0b2031', cyan: '#57d9d2', amber: '#ffbf69', white: '#dceaf0', red: '#fa7785' };
+const COLORS = { ink: '#e5e5d9', ocean: '#afd2e1', cyan: '#245c80', amber: '#88672f', white: '#233a43', red: '#a5483e' };
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 const pointOf = p => Array.isArray(p) ? { x: finite(p[0]), y: finite(p[1]) } : { x: finite(p?.x), y: finite(p?.y) };
@@ -13,7 +13,7 @@ const weapons = Array.isArray(WEAPONS) ? Object.fromEntries(WEAPONS.map(w => [w.
 const HULL_DIMENSIONS = {
   carrier: [300, 52, 70000], battleship: [250, 33, 55000], cruiser: [185, 21, 14000],
   destroyer: [150, 18, 8000], frigate: [130, 15, 4500], corvette: [90, 11, 1400],
-  submarine: [100, 10, 5000], amphibious: [210, 28, 23000], supply: [195, 28, 24000], patrol: [60, 9, 700]
+  submarine: [100, 10, 5000], amphibious: [210, 28, 23000], supply: [195, 28, 24000], patrol: [60, 9, 700], minelayer: [100, 14, 2500], minesweeper: [60, 11, 800], coastal: [70, 20, 2000]
 };
 
 /** Canvas-only view. Camera coordinates and all public pointer coordinates use CSS pixels. */
@@ -170,48 +170,78 @@ export class NavalRenderer {
     const ctx = image.getContext('2d');
     ctx.scale(scale, scale);
     const ocean = ctx.createLinearGradient(0, 0, w, h);
-    ocean.addColorStop(0, '#102c40'); ocean.addColorStop(.48, '#0b2234'); ocean.addColorStop(1, '#071b2b');
-    ctx.fillStyle = ocean;
-    ctx.fillRect(0, 0, w, h);
-    // Deep-water contours are deterministic, so panning never makes terrain shimmer.
-    ctx.lineWidth = .5 / scale;
-    for (let j = 0; j < 38; j++) {
-      const y = h * (j / 31 - .08);
-      ctx.strokeStyle = j % 4 === 0 ? '#25445365' : '#1e3a4b45';
-      ctx.beginPath();
+    ocean.addColorStop(0, '#b9d9e5'); ocean.addColorStop(.55, '#acd0df'); ocean.addColorStop(1, '#a0c5d8');
+    ctx.fillStyle = ocean; ctx.fillRect(0, 0, w, h);
+    const land = this._landPolygons();
+    // Sparse low-contrast depth lines give scale without turning the sea into a HUD.
+    ctx.lineWidth = .55 / scale; ctx.strokeStyle = '#6b9fb41b';
+    for (let j = 0; j < 16; j++) {
+      const y = h * (j / 13 - .1); ctx.beginPath();
       for (let i = 0; i <= 80; i++) {
-        const x = w * i / 80;
-        const dy = Math.sin(i * .083 + j * .24) * h * .038 + Math.sin(i * .19 - j * .1) * h * .015;
+        const x = w * i / 80, dy = Math.sin(i * .073 + j * .41) * h * .044 + Math.sin(i * .17 - j * .13) * h * .016;
         if (!i) ctx.moveTo(x, y + dy); else ctx.lineTo(x, y + dy);
       }
       ctx.stroke();
     }
-    const land = this._landPolygons();
+    // Build land cover once. These patches are clipped by the exact navigable coastline.
+    const cover = land.map((points, index) => {
+      const xs = points.map(p => p.x), ys = points.map(p => p.y);
+      const bounds = { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
+      const bw = bounds.maxX - bounds.minX, bh = bounds.maxY - bounds.minY;
+      let seed = 9231 + index * 7919;
+      const rng = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) / 4294967296; };
+      const patches = [];
+      for (let j = 0; j < 38; j++) {
+        const cx = bounds.minX + rng() * bw, cy = bounds.minY + rng() * bh;
+        const rx = bw * (.045 + rng() * .14), ry = bh * (.05 + rng() * .12);
+        const rock = j % 7 === 0, polygon = [];
+        for (let k = 0; k < 18; k++) {
+          const a = k * TAU / 18, radius = .76 + rng() * .3;
+          polygon.push({ x: cx + Math.cos(a) * rx * radius, y: cy + Math.sin(a) * ry * radius });
+        }
+        patches.push({ points: polygon, cx, cy, radius: Math.max(rx, ry), rock, color: rock ? '#a4a99a' : ['#8d9e77', '#a1af88', '#859a77', '#b0ba94'][j % 4] });
+      }
+      return { points, bounds, patches };
+    });
+    this._mapCache = { source: this.map, image, w, h, land, cover, scale };
+    this._paintLand(ctx, scale);
+  }
+
+  _paintLand(ctx, scale, visibleBounds = null) {
+    const shore = Math.min(this.map.width, this.map.height) * .0022;
     ctx.lineJoin = 'round';
-    for (const p of land) {
-      for (const [width, color] of [[9, '#15374888'], [5.4, '#1a435280'], [2.7, '#24546275'], [1.1, '#35717a65']]) {
-        this._polygon(ctx, p); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
+    for (const item of this._mapCache.cover) {
+      const { points, bounds, patches } = item;
+      if (visibleBounds && (bounds.maxX + shore * 4 < visibleBounds.left || bounds.minX - shore * 4 > visibleBounds.right || bounds.maxY + shore * 4 < visibleBounds.top || bounds.minY - shore * 4 > visibleBounds.bottom)) continue;
+      this._polygon(ctx, points); ctx.strokeStyle = '#c9e4e6'; ctx.lineWidth = shore * 3.5; ctx.stroke();
+      this._polygon(ctx, points); ctx.fillStyle = '#b5bf98'; ctx.fill();
+      ctx.save(); this._polygon(ctx, points); ctx.clip();
+      for (const patch of patches) {
+        const p = patch.points, first = p[0], last = p.at(-1);
+        ctx.beginPath(); ctx.moveTo((first.x + last.x) / 2, (first.y + last.y) / 2);
+        for (let i = 0; i < p.length; i++) { const next = p[(i + 1) % p.length]; ctx.quadraticCurveTo(p[i].x, p[i].y, (p[i].x + next.x) / 2, (p[i].y + next.y) / 2); }
+        ctx.closePath();
+        const shade = ctx.createRadialGradient(patch.cx, patch.cy, 0, patch.cx, patch.cy, patch.radius);
+        shade.addColorStop(0, patch.color + 'c0'); shade.addColorStop(.62, patch.color + '83'); shade.addColorStop(1, patch.color + '18');
+        ctx.fillStyle = shade; ctx.fill();
+        if (patch.rock) {
+          ctx.strokeStyle = '#7a826b28'; ctx.lineWidth = .65 / scale;
+          ctx.beginPath(); ctx.moveTo(patch.cx - patch.radius * .35, patch.cy + patch.radius * .15);
+          ctx.quadraticCurveTo(patch.cx, patch.cy - patch.radius * .24, patch.cx + patch.radius * .32, patch.cy - patch.radius * .08); ctx.stroke();
+        }
       }
-      this._polygon(ctx, p);
-      const ground = ctx.createLinearGradient(0, 0, w * .3, h);
-      ground.addColorStop(0, '#35504d'); ground.addColorStop(1, '#223b3c');
-      ctx.fillStyle = ground; ctx.fill();
-      ctx.strokeStyle = '#719084'; ctx.lineWidth = .6 / scale + .16; ctx.stroke();
-      ctx.save();
-      this._polygon(ctx, p); ctx.clip();
-      const cx = p.reduce((sum, v) => sum + v.x, 0) / p.length;
-      const cy = p.reduce((sum, v) => sum + v.y, 0) / p.length;
-      for (let inset = .84; inset > .23; inset -= .17) {
-        const contour = p.map(v => ({ x: cx + (v.x - cx) * inset, y: cy + (v.y - cy) * inset }));
-        this._polygon(ctx, contour);
-        ctx.fillStyle = '#6882700b'; ctx.fill();
-        ctx.strokeStyle = '#9caa8124'; ctx.lineWidth = .7 / scale; ctx.stroke();
-      }
-      ctx.strokeStyle = '#aac0a00c'; ctx.lineWidth = 1 / scale;
-      for (let y = 0; y < h; y += 3) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y - w * .3); ctx.stroke(); }
+      this._polygon(ctx, points); ctx.strokeStyle = '#ded3ac'; ctx.lineWidth = shore * 1.05; ctx.stroke();
       ctx.restore();
+      this._polygon(ctx, points); ctx.strokeStyle = '#8d9279'; ctx.lineWidth = .65 / scale; ctx.stroke();
     }
-    this._mapCache = { source: this.map, image, w, h, land };
+  }
+
+  _drawDetailedCoast() {
+    if (this.camera.zoom <= this._mapCache.scale * 2) return;
+    const origin = this.worldToScreen(0, 0), a = this.screenToWorld(0, 0), b = this.screenToWorld(this.width, this.height);
+    this.ctx.save(); this.ctx.translate(origin.x, origin.y); this.ctx.scale(this.camera.zoom, this.camera.zoom);
+    this._paintLand(this.ctx, this.camera.zoom, { left: a.x, right: b.x, top: a.y, bottom: b.y });
+    this.ctx.restore();
   }
 
   render(options = {}) {
@@ -236,14 +266,16 @@ export class NavalRenderer {
     const { w, h } = this._dimensions();
     const origin = this.worldToScreen(0, 0);
     ctx.save();
-    ctx.shadowColor = '#0009'; ctx.shadowBlur = 24;
+    ctx.shadowColor = '#52656725'; ctx.shadowBlur = 16;
     ctx.fillStyle = COLORS.ocean; ctx.fillRect(origin.x, origin.y, w * this.camera.zoom, h * this.camera.zoom);
     ctx.shadowBlur = 0;
     ctx.beginPath(); ctx.rect(origin.x, origin.y, w * this.camera.zoom, h * this.camera.zoom); ctx.clip();
     ctx.drawImage(this._mapCache.image, origin.x, origin.y, w * this.camera.zoom, h * this.camera.zoom);
+    this._drawDetailedCoast();
     this._drawGrid();
     this._drawFog();
     this._drawObjectives(options.showLabels !== false);
+    this._drawMines();
     if (options.showSensors) this._drawSensors();
     if (options.showRanges) this._drawRanges();
     this._drawOrders();
@@ -265,12 +297,12 @@ export class NavalRenderer {
     const step = this._niceStep(90 / this.camera.zoom);
     const a = this.screenToWorld(0, 0), b = this.screenToWorld(this.width, this.height);
     ctx.lineWidth = 1;
-    ctx.strokeStyle = '#89b9c610';
+    ctx.strokeStyle = '#52788a24';
     ctx.beginPath();
     for (let x = Math.max(0, Math.ceil(a.x / step) * step); x <= Math.min(w, b.x); x += step) { const p = this.worldToScreen(x, 0); ctx.moveTo(Math.round(p.x) + .5, 0); ctx.lineTo(Math.round(p.x) + .5, this.height); }
     for (let y = Math.max(0, Math.ceil(a.y / step) * step); y <= Math.min(h, b.y); y += step) { const p = this.worldToScreen(0, y); ctx.moveTo(0, Math.round(p.y) + .5); ctx.lineTo(this.width, Math.round(p.y) + .5); }
     ctx.stroke();
-    ctx.fillStyle = '#80b5c028';
+    ctx.fillStyle = '#52788a24';
     for (let x = Math.max(0, Math.ceil(a.x / step) * step); x <= Math.min(w, b.x); x += step) {
       for (let y = Math.max(0, Math.ceil(a.y / step) * step); y <= Math.min(h, b.y); y += step) {
         const p = this.worldToScreen(x, y); ctx.fillRect(p.x - 2, p.y, 5, 1); ctx.fillRect(p.x, p.y - 2, 1, 5);
@@ -292,7 +324,8 @@ export class NavalRenderer {
     const ctx = this._fogCtx;
     ctx.clearRect(0, 0, this.width, this.height);
     ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = '#020c16a6'; ctx.fillRect(0, 0, this.width, this.height);
+    // The chart remains readable outside coverage; contact visibility is enforced by the engine.
+    ctx.fillStyle = '#e9ede91c'; ctx.fillRect(0, 0, this.width, this.height);
     ctx.globalCompositeOperation = 'destination-out';
     for (const sensor of this.sensors) {
       const radius = Math.max(sensor.radar, sensor.visual, sensor.sonar * .8) * this.camera.zoom;
@@ -317,7 +350,7 @@ export class NavalRenderer {
       const selected = this.selected.has(ship.id);
       const radar = Math.max(ship.emcon ? 0 : rangeOf(ship.radar), rangeOf(ship.visual));
       const sonar = rangeOf(ship.sonar);
-      for (const [range, color, label] of [[radar, '#57d9d2', 'Sensor envelope'], [sonar, '#82a9e6', 'Sonar']]) {
+      for (const [range, color, label] of [[radar, COLORS.cyan, 'Sensor envelope'], [sonar, '#637987', 'Sonar']]) {
         if (!range) continue;
         const radius = range * this.camera.zoom;
         ctx.strokeStyle = color; ctx.globalAlpha = selected ? .36 : .105;
@@ -346,7 +379,7 @@ export class NavalRenderer {
       }
       for (const item of [...groups.values()].sort((a, b) => b.range - a.range).slice(0, 4)) {
         const p = this.worldToScreen(ship.x, ship.y), r = item.range * this.camera.zoom;
-        const color = item.kind === 'torpedo' || item.kind === 'depthcharge' ? '#90b8e8' : item.kind === 'sam' ? '#57d9d2' : '#ffbf69';
+        const color = item.kind === 'torpedo' || item.kind === 'depthcharge' ? '#536f86' : item.kind === 'sam' ? COLORS.cyan : COLORS.amber;
         ctx.globalAlpha = .32; ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash([3, 7]);
         ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, TAU); ctx.stroke();
         if (this.selected.size === 1 && r > 40) {
@@ -396,6 +429,47 @@ export class NavalRenderer {
     ctx.restore();
   }
 
+  _drawMines() {
+    const mines = typeof this.game?.getVisibleMines === 'function' ? this.game.getVisibleMines('blue') : [];
+    const ctx = this.ctx; ctx.save();
+    for (const mine of mines) {
+      if (mine.status !== 'active' || !Number.isFinite(mine.x) || !Number.isFinite(mine.y)) continue;
+      const p = this.worldToScreen(mine.x, mine.y);
+      if (!this._onScreen(p, 8)) continue;
+      const radius = clamp(this.camera.zoom * .018, 1.1, 2.7);
+      ctx.strokeStyle = mine.side === 'blue' ? '#566b58' : COLORS.red;
+      ctx.fillStyle = mine.side === 'blue' ? '#566b58' : COLORS.red; ctx.lineWidth = 1; ctx.globalAlpha = .9;
+      ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, TAU); ctx.fill();
+      if (this.camera.zoom >= 20) {
+        ctx.beginPath();
+        for (let i = 0; i < 4; i++) {
+          const a = i * Math.PI / 2 + .25;
+          ctx.moveTo(p.x + Math.cos(a) * radius, p.y + Math.sin(a) * radius);
+          ctx.lineTo(p.x + Math.cos(a) * (radius + 1.5), p.y + Math.sin(a) * (radius + 1.5));
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  _drawCoastal(ship, p, selected, hovered) {
+    const ctx = this.ctx, color = sideColor(ship.side), radius = clamp(this._shipLength(ship) * .5, 6, 26);
+    ctx.save(); ctx.translate(p.x, p.y);
+    if (selected || hovered) { ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.beginPath(); ctx.arc(0, 0, radius + 5, 0, TAU); ctx.stroke(); }
+    ctx.fillStyle = '#e2dbc6'; ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.fillRect(-radius, -radius * .65, radius * 2, radius * 1.3); ctx.strokeRect(-radius, -radius * .65, radius * 2, radius * 1.3);
+    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(0, 0, radius * .35, 0, TAU); ctx.fill();
+    ctx.rotate(finite(ship.heading)); ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(radius * 1.2, 0); ctx.stroke(); ctx.restore();
+    if (selected || hovered) {
+      const hp = clamp(finite(ship.hp) / Math.max(1, finite(ship.maxHp, 1)), 0, 1);
+      ctx.fillStyle = '#f9f7eae8'; ctx.fillRect(p.x - 17, p.y + radius + 7, 34, 6);
+      ctx.fillStyle = '#a5afa8'; ctx.fillRect(p.x - 15, p.y + radius + 9, 30, 2);
+      ctx.fillStyle = hp < .28 ? COLORS.red : color; ctx.fillRect(p.x - 15, p.y + radius + 9, 30 * hp, 2);
+    }
+  }
+
   _shipDimensions(ship) {
     const [baseLength, baseBeam, baseTonnage] = HULL_DIMENSIONS[roleOf(ship)] || HULL_DIMENSIONS.destroyer;
     const data = ship.classData || ship;
@@ -422,6 +496,7 @@ export class NavalRenderer {
     const ctx = this.ctx, p = this.worldToScreen(ship.x, ship.y);
     const length = this._shipLength(ship), beam = this._shipBeam(ship), selected = this.selected.has(ship.id), role = roleOf(ship);
     if (!this._onScreen(p, Math.max(180, length * 3))) return;
+    if (role === 'coastal') { this._drawCoastal(ship, p, selected, hovered); return; }
     const color = sideColor(ship.side), heading = finite(ship.heading);
     let alive = 1;
     if (ship.status === 'sinking') {
@@ -447,7 +522,7 @@ export class NavalRenderer {
     ctx.rotate(heading + (1 - alive) * .2);
     if (length >= 14 && ship.status === 'active' && finite(ship.speed) > .0005) {
       const wakeLength = length * clamp(.75 + finite(ship.speed) * 20, .8, 2);
-      ctx.strokeStyle = role === 'submarine' ? '#6b9bad' : '#a8dce1';
+      ctx.strokeStyle = role === 'submarine' ? '#6b9bad' : '#f2faf8';
       ctx.globalAlpha = role === 'submarine' ? .09 : .2;
       ctx.lineWidth = 1;
       for (const side of [-1, 1]) {
@@ -476,7 +551,7 @@ export class NavalRenderer {
     const lw = 2 / length;
     ctx.lineWidth = lw;
     ctx.lineJoin = 'round';
-    ctx.shadowColor = '#000b'; ctx.shadowBlur = length >= 14 ? 3 : 0; ctx.shadowOffsetY = length >= 14 ? 1 : 0;
+    ctx.shadowColor = '#344b5140'; ctx.shadowBlur = length >= 14 ? 2 : 0; ctx.shadowOffsetY = length >= 14 ? 1 : 0;
     ctx.beginPath();
     if (role === 'submarine') {
       ctx.moveTo(.77, -width); ctx.bezierCurveTo(1.09, -width, 1.09, width, .77, width);
@@ -484,8 +559,8 @@ export class NavalRenderer {
     } else {
       ctx.moveTo(1, 0); ctx.lineTo(.58, -width); ctx.lineTo(-.81, -width); ctx.lineTo(-.96, -width * .7); ctx.lineTo(-.96, width * .7); ctx.lineTo(-.81, width); ctx.lineTo(.58, width); ctx.closePath();
     }
-    ctx.fillStyle = ship.side === 'red' ? '#bc8e98' : '#acc4cc'; ctx.fill();
-    ctx.strokeStyle = selected ? color : ship.side === 'red' ? '#e2acb4' : '#d0e3e5'; ctx.stroke();
+    ctx.fillStyle = length < 14 ? color : ship.side === 'red' ? '#b5a69d' : '#91a1a2'; ctx.fill();
+    ctx.strokeStyle = color; ctx.stroke();
     ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
     ctx.fillStyle = ship.side === 'red' ? '#644b58' : '#3e5b69';
     ctx.strokeStyle = ship.side === 'red' ? '#d4a6ad' : '#bacfd5';
@@ -507,6 +582,19 @@ export class NavalRenderer {
       ctx.strokeStyle = '#d9e6e5'; ctx.lineWidth = lw;
       ctx.beginPath(); ctx.moveTo(.1, -.16); ctx.lineTo(.1, .16); ctx.moveTo(-.75, -.3); ctx.lineTo(-.75, .3); ctx.moveTo(-.98, 0); ctx.lineTo(-1.13, 0); ctx.stroke();
       ctx.fillStyle = '#a8c4cb'; ctx.fillRect(.09, -.035, .04, .07);
+    } else if (length >= 12 && (role === 'minelayer' || role === 'minesweeper')) {
+      ctx.fillStyle = '#566866'; ctx.fillRect(-.77, -width * .75, 1.08, width * 1.5);
+      ctx.fillStyle = '#d1d7ce'; ctx.fillRect(.29, -.13, .25, .26);
+      ctx.strokeStyle = '#d9ddce'; ctx.lineWidth = lw;
+      if (role === 'minelayer') {
+        for (const y of [-.09, .09]) {
+          ctx.beginPath(); ctx.moveTo(-.82, y); ctx.lineTo(.2, y); ctx.stroke();
+          for (const x of [-.62, -.3, .02]) { ctx.fillStyle = '#2e4547'; ctx.beginPath(); ctx.arc(x, y, .065, 0, TAU); ctx.fill(); }
+        }
+      } else {
+        ctx.beginPath(); ctx.moveTo(-.8, -.16); ctx.lineTo(-.37, 0); ctx.lineTo(-.8, .16); ctx.moveTo(-.7, 0); ctx.lineTo(-1.12, 0); ctx.stroke();
+        ctx.strokeRect(-.57, -.11, .19, .22);
+      }
     } else if (length >= 12 && (role === 'supply' || role === 'amphibious')) {
       ctx.fillStyle = '#405a64'; ctx.fillRect(-.72, -width * .76, 1.1, width * 1.52);
       if (role === 'supply') {
@@ -555,8 +643,8 @@ export class NavalRenderer {
     const hp = clamp(finite(ship.hp) / Math.max(1, finite(ship.maxHp, 1)), 0, 1);
     if (selected || hovered || (hp < .96 && this.camera.zoom >= 20)) {
       const barWidth = clamp(length * 1.15, 27, 62), y = p.y + length * .55 + 5;
-      ctx.fillStyle = '#061522de'; ctx.fillRect(p.x - barWidth / 2 - 2, y - 2, barWidth + 4, 6);
-      ctx.fillStyle = '#45606b'; ctx.fillRect(p.x - barWidth / 2, y, barWidth, 2);
+      ctx.fillStyle = '#f9f7eade'; ctx.fillRect(p.x - barWidth / 2 - 2, y - 2, barWidth + 4, 6);
+      ctx.fillStyle = '#a5afa8'; ctx.fillRect(p.x - barWidth / 2, y, barWidth, 2);
       ctx.fillStyle = hp < .28 ? COLORS.red : hp < .55 ? COLORS.amber : color; ctx.fillRect(p.x - barWidth / 2, y, barWidth * hp, 2);
     }
     if (ship.manual && selected) {
@@ -586,22 +674,23 @@ export class NavalRenderer {
 
   _drawLabels(hoverId) {
     const ctx = this.ctx, boxes = [];
-    ctx.save(); ctx.font = '10px Inter, "Segoe UI", Arial, sans-serif';
+    ctx.save(); ctx.font = '12px Inter, "Segoe UI", Arial, sans-serif';
     const ordered = [...this.visible].sort((a, b) => Number(this.selected.has(b.id) || b.id === hoverId) - Number(this.selected.has(a.id) || a.id === hoverId));
     for (const ship of ordered) {
       const selected = this.selected.has(ship.id), important = selected || ship.id === hoverId;
       if (!important && this.camera.zoom < 18) continue;
       const p = this.worldToScreen(ship.x, ship.y);
       if (!this._onScreen(p, 10)) continue;
-      const text = (ship.name || ship.classData?.name || ship.classId || 'Vessel') + (ship.status === 'sinking' ? ' · Sinking' : '');
+      const depthLabel = roleOf(ship) === 'submarine' && ship.side === 'blue' ? (ship.depthMeters < .05 ? ' · Surfaced' : ` · ${finite(ship.depthMeters).toFixed(0)} m`) : '';
+      const text = (ship.name || ship.classData?.name || ship.classId || 'Vessel') + (ship.status === 'sinking' ? ' · Sinking' : depthLabel);
       const width = ctx.measureText(text).width + 10;
       const length = this._shipLength(ship), hp = finite(ship.hp) / Math.max(1, finite(ship.maxHp, 1));
-      const box = { x: p.x - width / 2, y: p.y + length * .55 + (selected || hp < .96 ? 13 : 7), w: width, h: 17 };
+      const box = { x: p.x - width / 2, y: p.y + length * .55 + (selected || hp < .96 ? 13 : 7), w: width, h: 20 };
       if (!important && boxes.some(b => box.x < b.x + b.w + 3 && box.x + box.w > b.x - 3 && box.y < b.y + b.h && box.y + box.h > b.y)) continue;
       boxes.push(box);
-      ctx.fillStyle = important ? '#061522e0' : '#0615229c';
+      ctx.fillStyle = important ? '#f9f7efe8' : '#f6f5eecf';
       ctx.fillRect(box.x, box.y - 3, box.w, box.h);
-      ctx.fillStyle = ship.status === 'sinking' ? '#a99691' : selected ? COLORS.white : ship.side === 'red' ? '#e5a2aa' : '#9ab7c4';
+      ctx.fillStyle = ship.status === 'sinking' ? '#77665b' : ship.side === 'red' ? COLORS.red : COLORS.cyan;
       ctx.fillText(text, box.x + 5, box.y + 9);
     }
     ctx.restore();
@@ -619,7 +708,7 @@ export class NavalRenderer {
       ctx.translate(p.x, p.y); ctx.globalAlpha = .7;
       ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash([2, 5]);
       ctx.beginPath(); ctx.arc(0, 0, 27, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
-      ctx.fillStyle = '#0a1b25e0'; ctx.beginPath(); ctx.moveTo(0, -16); ctx.lineTo(16, 0); ctx.lineTo(0, 16); ctx.lineTo(-16, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#f7f3e5ec'; ctx.beginPath(); ctx.moveTo(0, -16); ctx.lineTo(16, 0); ctx.lineTo(0, 16); ctx.lineTo(-16, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
       ctx.globalAlpha = 1; ctx.strokeStyle = color; ctx.lineWidth = 1.4;
       if (obj.kind === 'port') {
         ctx.beginPath(); ctx.moveTo(0, -7); ctx.lineTo(0, 7); ctx.moveTo(-5, -3); ctx.lineTo(5, -3); ctx.moveTo(-7, 2); ctx.quadraticCurveTo(-6, 8, 0, 8); ctx.quadraticCurveTo(6, 8, 7, 2); ctx.moveTo(-7, 2); ctx.lineTo(-3, 4); ctx.moveTo(7, 2); ctx.lineTo(3, 4); ctx.stroke();
@@ -631,9 +720,9 @@ export class NavalRenderer {
       if (cap > 0) { ctx.strokeStyle = obj.captureSide ? sideColor(obj.captureSide) : color; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, 22, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(cap / 100, 0, 1)); ctx.stroke(); }
       if (showLabels) {
         const name = obj.name || (obj.kind === 'port' ? 'Strategic port' : 'Control point');
-        ctx.font = '11px Inter, "Segoe UI", Arial, sans-serif'; ctx.textAlign = 'center';
+        ctx.font = '12px Inter, "Segoe UI", Arial, sans-serif'; ctx.textAlign = 'center';
         const tw = ctx.measureText(name).width;
-        ctx.fillStyle = '#061522bd'; ctx.fillRect(-tw / 2 - 6, 31, tw + 12, 19);
+        ctx.fillStyle = '#f6f4e9df'; ctx.fillRect(-tw / 2 - 6, 31, tw + 12, 19);
         ctx.fillStyle = color; ctx.fillText(name, 0, 44); ctx.textAlign = 'left';
       }
       if (obj.maxHp && obj.hp < obj.maxHp) {
@@ -681,7 +770,7 @@ export class NavalRenderer {
       if (!style.visible) continue;
       const p = this.worldToScreen(projectile.x, projectile.y), kind = projectile.kind || 'missile';
       if (!this._onScreen(p, 12)) continue;
-      const color = kind === 'torpedo' || kind === 'depthcharge' ? '#a6d9ce' : kind === 'sam' || kind === 'ciws' ? '#91e5e6' : kind === 'aircraft' ? (projectile.side === 'red' ? '#ffc2c4' : '#d7eef0') : '#ffd18b';
+      const color = kind === 'torpedo' || kind === 'depthcharge' ? '#47696b' : kind === 'sam' || kind === 'ciws' ? '#426983' : kind === 'aircraft' ? sideColor(projectile.side) : '#875538';
       ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(finite(projectile.heading));
       const half = style.length / 2;
       // Exhaust is deliberately bounded in screen space: a fast weapon never leaves a chart-spanning beam.
@@ -773,7 +862,7 @@ export class NavalRenderer {
     ctx.strokeRect(origin.x + .5, origin.y + .5, w * zoom, h * zoom);
     const step = this._niceStep(110 / zoom), a = this.screenToWorld(0, 0), b = this.screenToWorld(this.width, this.height);
     const topY = Math.max(0, origin.y), leftX = Math.max(0, origin.x);
-    ctx.font = '9px ui-monospace, Consolas, monospace'; ctx.fillStyle = '#799ba9'; ctx.strokeStyle = '#6f929a75';
+    ctx.font = '10px ui-monospace, Consolas, monospace'; ctx.fillStyle = '#4a6976'; ctx.strokeStyle = '#6f929a75';
     ctx.textAlign = 'center';
     if (topY < this.height - 22) {
       for (let x = Math.max(0, Math.ceil(a.x / step) * step); x <= Math.min(w, b.x); x += step) {
@@ -799,17 +888,17 @@ export class NavalRenderer {
     const ctx = this.ctx;
     ctx.save();
     const x = this.width - 32, y = 42;
-    ctx.fillStyle = '#06152280'; ctx.beginPath(); ctx.arc(x, y, 21, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#f7f4e9c4'; ctx.beginPath(); ctx.arc(x, y, 21, 0, TAU); ctx.fill();
     ctx.strokeStyle = '#71909d'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(x, y - 12); ctx.lineTo(x, y + 12); ctx.moveTo(x - 12, y); ctx.lineTo(x + 12, y); ctx.stroke();
-    ctx.fillStyle = '#bacdd1'; ctx.beginPath(); ctx.moveTo(x, y - 15); ctx.lineTo(x - 4, y - 4); ctx.lineTo(x + 4, y - 4); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = '#b1c7cf'; ctx.font = '10px ui-monospace, Consolas, monospace'; ctx.textAlign = 'center'; ctx.fillText('N', x, y - 23);
+    ctx.fillStyle = '#3c5660'; ctx.beginPath(); ctx.moveTo(x, y - 15); ctx.lineTo(x - 4, y - 4); ctx.lineTo(x + 4, y - 4); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#3c5660'; ctx.font = '10px ui-monospace, Consolas, monospace'; ctx.textAlign = 'center'; ctx.fillText('N', x, y - 23);
     const distance = this._niceStep(80 / this.camera.zoom), length = distance * this.camera.zoom;
     const left = 21, bottom = this.height - 23;
-    ctx.fillStyle = '#061522c4'; ctx.fillRect(left - 8, bottom - 25, length + 74, 38);
-    ctx.strokeStyle = '#a6bec7'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#f7f4e9df'; ctx.fillRect(left - 8, bottom - 25, length + 74, 38);
+    ctx.strokeStyle = '#4b6672'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(left, bottom - 5); ctx.lineTo(left, bottom); ctx.lineTo(left + length, bottom); ctx.lineTo(left + length, bottom - 5); ctx.moveTo(left + length / 2, bottom); ctx.lineTo(left + length / 2, bottom - 3); ctx.stroke();
-    ctx.textAlign = 'left'; ctx.fillStyle = '#9bb6c3'; ctx.fillText('0', left, bottom - 9);
+    ctx.textAlign = 'left'; ctx.fillStyle = '#405e6a'; ctx.fillText('0', left, bottom - 9);
     ctx.textAlign = 'right'; ctx.fillText(`${Number(distance.toPrecision(3))} km`, left + length, bottom - 9);
     ctx.textAlign = 'left'; ctx.fillStyle = '#547a89'; ctx.fillText('CHART', left + length + 12, bottom - 1);
     ctx.restore();
@@ -818,7 +907,7 @@ export class NavalRenderer {
   _drawSelection(rect) {
     const ctx = this.ctx;
     const x = finite(rect.x), y = finite(rect.y), w = finite(rect.w), h = finite(rect.h);
-    ctx.save(); ctx.fillStyle = '#57d9d216'; ctx.strokeStyle = '#70e6dd'; ctx.lineWidth = 1;
+    ctx.save(); ctx.fillStyle = '#245c8018'; ctx.strokeStyle = COLORS.cyan; ctx.lineWidth = 1;
     ctx.fillRect(x, y, w, h); ctx.strokeRect(Math.round(x) + .5, Math.round(y) + .5, w, h);
     ctx.restore();
   }
@@ -829,10 +918,10 @@ export class NavalRenderer {
     const { w, h } = this._dimensions(), mm = this._miniTransform();
     const width = this.miniWidth, height = this.miniHeight;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    ctx.globalAlpha = 1; ctx.fillStyle = '#061522'; ctx.fillRect(0, 0, width, height);
+    ctx.globalAlpha = 1; ctx.fillStyle = COLORS.ink; ctx.fillRect(0, 0, width, height);
     ctx.save(); ctx.beginPath(); ctx.rect(mm.x, mm.y, w * mm.scale, h * mm.scale); ctx.clip();
     ctx.drawImage(this._mapCache.image, mm.x, mm.y, w * mm.scale, h * mm.scale);
-    ctx.fillStyle = '#020c1666'; ctx.fillRect(mm.x, mm.y, w * mm.scale, h * mm.scale);
+
     ctx.strokeStyle = '#7098a21e'; ctx.lineWidth = .5;
     for (let i = 1; i < 4; i++) {
       ctx.beginPath(); ctx.moveTo(mm.x + w * mm.scale * i / 4, mm.y); ctx.lineTo(mm.x + w * mm.scale * i / 4, mm.y + h * mm.scale);
@@ -843,23 +932,29 @@ export class NavalRenderer {
       ctx.strokeStyle = objective.owner === 'neutral' ? COLORS.amber : sideColor(objective.owner); ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x + 4, y); ctx.lineTo(x, y + 4); ctx.lineTo(x - 4, y); ctx.closePath(); ctx.stroke();
     }
+    for (const mine of typeof this.game?.getVisibleMines === 'function' ? this.game.getVisibleMines('blue') : []) {
+      if (mine.status !== 'active') continue;
+      ctx.fillStyle = mine.side === 'blue' ? '#566b58' : COLORS.red;
+      ctx.fillRect(mm.x + mine.x * mm.scale - .7, mm.y + mine.y * mm.scale - .7, 1.4, 1.4);
+    }
     const markerLength = clamp(4.2 - Math.sqrt(this.visible.length) * .18, 2.1, 3.5);
     for (const ship of this.visible) {
       if (ship.status === 'sunk') continue;
       const x = mm.x + ship.x * mm.scale, y = mm.y + ship.y * mm.scale;
       ctx.save(); ctx.translate(x, y); ctx.rotate(finite(ship.heading));
       ctx.fillStyle = sideColor(ship.side); ctx.globalAlpha = ship.status === 'sinking' ? .35 : .9;
-      ctx.beginPath(); ctx.moveTo(markerLength * .6, 0); ctx.lineTo(-markerLength * .4, -markerLength * .3); ctx.lineTo(-markerLength * .4, markerLength * .3); ctx.closePath(); ctx.fill();
-      if (this.selected.has(ship.id)) { ctx.strokeStyle = '#e5f9f8'; ctx.lineWidth = .7; ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, TAU); ctx.stroke(); }
+      if (roleOf(ship) === 'coastal') ctx.fillRect(-2, -2, 4, 4);
+      else { ctx.beginPath(); ctx.moveTo(markerLength * .6, 0); ctx.lineTo(-markerLength * .4, -markerLength * .3); ctx.lineTo(-markerLength * .4, markerLength * .3); ctx.closePath(); ctx.fill(); }
+      if (this.selected.has(ship.id)) { ctx.strokeStyle = '#183e55'; ctx.lineWidth = .7; ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, TAU); ctx.stroke(); }
       ctx.restore();
     }
     const a = this.screenToWorld(0, 0), b = this.screenToWorld(this.width, this.height);
     const vx = mm.x + a.x * mm.scale, vy = mm.y + a.y * mm.scale, vw = (b.x - a.x) * mm.scale, vh = (b.y - a.y) * mm.scale;
     ctx.fillStyle = '#9bd9dc0e'; ctx.fillRect(vx, vy, vw, vh);
-    ctx.strokeStyle = '#c4eeee'; ctx.lineWidth = 1; ctx.strokeRect(vx, vy, vw, vh);
+    ctx.strokeStyle = '#2d5365'; ctx.lineWidth = 1; ctx.strokeRect(vx, vy, vw, vh);
     ctx.restore();
     ctx.strokeStyle = '#41616e'; ctx.lineWidth = 1; ctx.strokeRect(mm.x + .5, mm.y + .5, w * mm.scale, h * mm.scale);
-    ctx.fillStyle = '#9bb9c5'; ctx.font = '8px ui-monospace, monospace'; ctx.fillText('N', width - 12, 12);
+    ctx.fillStyle = '#405e6a'; ctx.font = '8px ui-monospace, monospace'; ctx.fillText('N', width - 12, 12);
   }
 }
 

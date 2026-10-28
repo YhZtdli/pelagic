@@ -1,0 +1,12 @@
+{
+  "version": "1.4.0",
+  "edition": "browser",
+  "sourceHashes": {
+    "src/depth.js": "6d0095ffd340fbc83f5da3488600051273f981f74aa9848391c6fc65e21bb7dc",
+    "src/engine.js": "55f123fff93deef84a1b26045af6243b558e36e2bff768ba6437e9f48dcbab63",
+    "src/main.js": "ddc2ef5659d1e0d2ef9b433fbffe96625a38192cd63a6575ca30ab982d78b9c6",
+    "src/navigation.js": "fc5f9fb8b193f7fc25bfa9cc01e7519f4f1a23126d6e487744d61c090178ab98",
+    "src/renderer.js": "31a53308051eea4ef2a818c5abb6dee2236cd7154615bf08a7a39a3a00518ef8",
+    "src/terrain.js": "de52b09809819953d000dfba33074b8f25b558b39d5ec2e26364053841499225"
+  }
+}

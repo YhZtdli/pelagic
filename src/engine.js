@@ -1,4 +1,8 @@
-import { MAPS, FACTIONS, SHIP_CLASSES, WEAPONS, createFleet } from '../data/catalog.js';
+import { MAPS, FACTIONS, SHIP_CLASSES, WEAPONS, MINE_TYPES, createFleet } from '../data/catalog.js?v=1.4.0';
+
+import { naturalizeMap } from './terrain.js?v=1.4.0';
+import { advanceFleet } from './navigation.js?v=1.4.0';
+import {depthProfile, isSubmarine, isSubmerged, depthWeaponRestriction, depthTargetCompatible, weaponLaunchDepth, mineCanTrigger} from './depth.js?v=1.4.0';
 
 const TAU = Math.PI * 2;
 const KNOT = 1.852 / 3600;
@@ -16,12 +20,14 @@ const VALUE = {carrier: 10, battleship: 8, cruiser: 6, destroyer: 4, frigate: 3,
 
 /** Deterministic naval simulation. Coordinates are kilometres; all clocks use simulation seconds. */
 export class NavalGame {
-  constructor({era = 'modern', blueFaction, redFaction, mapId, mode = 'encounter', scale = 'standard', seed = 41729} = {}) {
+  constructor({era = 'modern', blueFaction, redFaction, mapId, mode = 'encounter', scale = 'standard', durationHours = 6, seed = 41729} = {}) {
+    durationHours = Number(durationHours);
+    if (!Number.isFinite(durationHours) || durationHours < 2 || durationHours > 24) throw new RangeError('Operation duration must be between 2 and 24 hours');
     const eraId = SHIP_CLASSES[era] ? era : Object.keys(SHIP_CLASSES)[0];
     const blue = FACTIONS.find(f => f.id === blueFaction) || FACTIONS[0];
     const red = FACTIONS.find(f => f.id === redFaction) || FACTIONS[Math.min(1, FACTIONS.length - 1)];
     const sourceMap = MAPS.find(m => m.id === mapId) || MAPS[0];
-    this.config = {era: eraId, blueFaction: blue.id, redFaction: red.id, mapId: sourceMap.id, mode, scale, seed: (Number(seed) >>> 0) || 1, duration: 10800, captureTarget: 1800, balanceVersion: 2};
+    this.config = {era: eraId, blueFaction: blue.id, redFaction: red.id, mapId: sourceMap.id, mode, scale, seed: (Number(seed) >>> 0) || 1, durationHours, duration: durationHours * 3600, captureTarget: 1800, balanceVersion: 3};
     this.map = clone(sourceMap);
     // Expand the chart itself, preserving coast geometry and real km/second units.
     // Fleets begin beyond surface sensors and must transit before a firing solution exists.
@@ -32,8 +38,7 @@ export class NavalGame {
       point.x *= theatreScale; point.y *= theatreScale;
     }
     for (const island of this.map.land || []) island.points = island.points.map(([x, y]) => [x * theatreScale, y * theatreScale]);
-    const passage = distance(this.map.spawns.blue, this.map.spawns.red) / (24 * KNOT);
-    this.config.duration = Math.ceil((mode.startsWith('port_') ? passage + 5400 : passage * .5 + 7200) / 300) * 300;
+    this.map = naturalizeMap(this.map, sourceMap.id);
     this._seed = (Number(seed) >>> 0) || 1;
     this._nextId = 1;
     this._sensorClock = 0;
@@ -43,8 +48,8 @@ export class NavalGame {
     this._accumulator = 0;
     this._salvoReservations = {};
     this.singleManualId = null;
-    this._gridCache = null;
-    this.state = {time: 0, ships: [], projectiles: [], effects: [], events: [], objectives: [], result: null, score: {blue: 0, red: 0}};
+    this._gridCache = null; this._terrainBounds = new WeakMap();
+    this.state = {time: 0, ships: [], mines: [], projectiles: [], effects: [], events: [], objectives: [], result: null, score: {blue: 0, red: 0}};
     for (const side of ['blue', 'red']) {
       const faction = side === 'blue' ? blue : red;
       const classes = createFleet(eraId, faction.id, side, scale);
@@ -65,6 +70,7 @@ export class NavalGame {
     }
     this.state.objectives = (this.map.objectives || []).map((o, i) => ({...clone(o), id: o.id || `objective-${i}`, owner: o.owner || 'neutral', initialOwner: o.owner || 'neutral', hp: o.kind === 'port' ? 5200 : 2200, maxHp: o.kind === 'port' ? 5200 : 2200, capture: 0}));
     this._prepareMode();
+    this._prepareSupport();
     this._updateSensors();
     this._event('Fleet deployed. Distances use kilometres; ship speeds use real knots.');
   }
@@ -87,13 +93,16 @@ export class NavalGame {
     const tech = faction.tech || 1;
     const ship = {
       id: this._id(side), side, classId, name: `${c.shortName || c.name} ${String(index + 1).padStart(2, '0')}`, classData: clone(c), tech,
-      x: p.x, y: p.y, heading, speed: 0, maxSpeed: c.speed * KNOT, hp: c.hp, maxHp: c.hp,
+      x: p.x, y: p.y, heading, speed: 0, turnVelocity: 0, contactRecoverySpeed: 0, collisionContacts: {}, avoidance: null, stationNavigation: null, stationResponseKey: null, stationResponseAt: 0, maxSpeed: c.speed * KNOT, hp: c.hp, maxHp: c.hp,
       armor: c.armor, radar: c.radar * tech, sonar: c.sonar * tech, visual: c.visual, signature: c.signature,
       status: 'active', sinkTimer: 0, manual: false, stance: 'balanced', formation: 'line', order: {type: 'auto', explicit: false},
       mounts: c.weapons.map(m => ({...m, capacity: m.capacity ?? m.ammo, ammo: m.ammo, cooldown: 0, nextSalvoAt: 0, salvoRemaining: 0, salvoTargetId: null, fireControlTargetId: null, solutionReadyAt: 0, airborne: 0, lost: 0, rearming: [], sortieStores: WEAPONS[m.weaponId]?.kind === 'aircraft' ? m.ammo * 2 : 0})),
       path: [], pathTarget: null, navigation: null, localContacts: [], detectedBy: {blue: side === 'blue', red: side === 'red'},
+      mineAmmo: c.mineCapacity || 0, mineActionAt: 0, mineSweepTargetId: null, mineSweepProgress: 0,
       lastContact: {}, commRange: 120 * tech, emcon: false, convoy: false, evacuated: false, lastDamageTime: -999, tactics: null
     };
+    const depth = depthProfile(ship).defaultDepthMeters;
+    Object.assign(ship, {depthMeters: depth, orderedDepthMeters: depth, verticalSpeed: 0, depthBlocked: false, depthOrderExplicit: false, depthDecisionAt: 0});
     this.state.ships.push(ship);
     return ship;
   }
@@ -123,35 +132,194 @@ export class NavalGame {
       this.convoyGoal = this._nearestWater({x: this.map.spawns.red.x, y: clamp(this.map.spawns.red.y + this.map.height * .3, 8, this.map.height - 8)});
       for (const s of convoys) { s.convoy = true; s.order = {type: 'move', ...this.convoyGoal, explicit: false}; }
       this.state.objectives.push({id: 'convoy-exit', ...this.convoyGoal, name: 'Convoy Extraction Zone', kind: 'exit', owner: 'blue', initialOwner: 'blue', hp: 1, maxHp: 1, capture: 0});
-      this.config.duration = Math.ceil(Math.max(10800, distance(this.map.spawns.blue, this.convoyGoal) / Math.max(.003, Math.min(...convoys.map(s => s.maxSpeed))) * 1.8 + 3600) / 300) * 300;
+      // The player-defined operational deadline remains authoritative for convoy missions.
     }
+  }
+
+  _landBounds(shape) {
+    this._terrainBounds ||= new WeakMap();
+    if (!this._terrainBounds.has(shape)) {
+      const points = shape.points || [];
+      this._terrainBounds.set(shape, {minX: Math.min(...points.map(p => p[0])), maxX: Math.max(...points.map(p => p[0])), minY: Math.min(...points.map(p => p[1])), maxY: Math.max(...points.map(p => p[1]))});
+    }
+    return this._terrainBounds.get(shape);
+  }
+
+  _prepareSupport() {
+    // Batteries occupy actual land, with a seaward observation point for coastline occlusion.
+    if (this.map.land.length) for (const side of ['blue', 'red']) {
+      const spawn = this.map.spawns[side], hostile = this.map.spawns[enemy(side)], candidates = [];
+      for (const shape of this.map.land) for (let i = 0; i < shape.points.length; i++) {
+        const a = shape.points[i], b = shape.points[(i + 1) % shape.points.length];
+        const midpoint = {x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2};
+        const bearing = Math.atan2(b[1] - a[1], b[0] - a[0]) + Math.PI / 2;
+        for (const sign of [-1, 1]) {
+          const land = {x: midpoint.x + Math.cos(bearing) * .15 * sign, y: midpoint.y + Math.sin(bearing) * .15 * sign};
+          const sea = {x: midpoint.x - Math.cos(bearing) * .75 * sign, y: midpoint.y - Math.sin(bearing) * .75 * sign};
+          if (land.x < .2 || land.y < .2 || land.x > this.map.width - .2 || land.y > this.map.height - .2) continue;
+          if (!this._onLand(land) || !this._segmentClear(sea, sea, .25)) continue;
+          if (distance(land, spawn) >= distance(land, hostile) - 15) continue;
+          if (this.state.ships.some(ship => distance(ship, land) < (ship.side === side ? 3 : this.config.era === 'modern' ? 55 : 40))) continue;
+          candidates.push({land, sea, distance: distance(land, spawn)});
+        }
+      }
+      candidates.sort((a, b) => a.distance - b.distance);
+      if (candidates[0]) {
+        const {land, sea} = candidates[0];
+        const battery = this._addShip('coastal_battery', side, this._faction(side), land, angle(land, sea));
+        battery.shorePoint = sea; battery.order = {type: 'hold', explicit: false};
+      }
+    }
+    for (const ship of this.state.ships.filter(s => s.side === 'red' && roleIs(s, 'minelayer'))) {
+      const bearing = angle(this.map.spawns.red, this.map.spawns.blue);
+      const point = this._nearestWater({x: ship.x + Math.cos(bearing) * 7, y: ship.y + Math.sin(bearing) * 7});
+      const plan = this._minePlan(ship, point, true);
+      if (plan.ok) { for (const p of plan.points) this._layMine(ship, p); ship.mineDeployments = 1; }
+    }
+  }
+
+  getVisibleMines(side = 'blue') {
+    return this.state.mines.filter(mine => mine.status === 'active' && (mine.side === side || mine.detectedBy[side]));
+  }
+
+  _minePlan(ship, point, preoperation = false) {
+    const invalid = reason => ({ok: false, reason});
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || !this._segmentClear(point, point, .25)) return invalid('Mine operations require navigable water inside the chart');
+    if (!ship.mineAmmo) return invalid('No mine stores remain');
+    if (preoperation && (distance(ship, point) > 18 || distance(point, this.map.spawns[ship.side]) > distance(point, this.map.spawns[enemy(ship.side)]))) return invalid('Pre-operation minefields must be within 18 km of the minelayer and in friendly waters');
+    const bearing = angle(this.map.spawns[ship.side], this.map.spawns[enemy(ship.side)]) + Math.PI / 2;
+    const count = Math.min(8, ship.mineAmmo), points = [];
+    for (let i = 0; i < count; i++) {
+      const offset = (i - (count - 1) / 2) * .55;
+      const p = {x: point.x + Math.cos(bearing) * offset, y: point.y + Math.sin(bearing) * offset};
+      if (!this._segmentClear(p, p, .25)) return invalid('The entire mine line must clear the shoreline and chart boundary');
+      if (this.getVisibleMines(ship.side).some(m => distance(m, p) < .35)) return invalid('The planned line overlaps an already charted minefield');
+      if (points.length && !this._segmentClear(points[points.length - 1], p, .25)) return invalid('Land blocks the mine-laying route');
+      points.push(p);
+    }
+    if (!preoperation && !this._route(ship, points[0]).length) return invalid('No navigable route to the mine-laying area');
+    return {ok: true, reason: '', points, count, bearing};
+  }
+
+  commandLayMines(ids, point) {
+    if (this.state.result) return {ok: false, reason: 'Battle has ended'};
+    const ships = this._orderedShips(ids).filter(s => roleIs(s, 'minelayer'));
+    if (!ships.length) return {ok: false, reason: 'Select a friendly minelayer'};
+    const plans = ships.map((ship, i) => ({ship, plan: this._minePlan(ship, point && {x: point.x + i * 5, y: point.y}, this.state.time === 0)}));
+    const invalid = plans.find(p => !p.plan.ok);
+    if (invalid) return invalid.plan;
+    let count = 0;
+    for (const {ship, plan} of plans) {
+      count += plan.count;
+      if (this.state.time === 0) {
+        for (const p of plan.points) this._layMine(ship, p);
+        ship.mineDeployments = (ship.mineDeployments || 0) + 1;
+      } else this._beginMineOrder(ship, plan, true);
+    }
+    this._event(this.state.time === 0 ? `${count} defensive mines placed before departure` : `Mine-laying route ordered for ${count} mines`, 'blue', 'private');
+    return {ok: true, reason: '', count};
+  }
+
+  _beginMineOrder(ship, plan, explicit) {
+    ship.avoidance = null; ship.stationNavigation = null; ship.stationResponseKey = null;
+    ship.order = {type: 'lay_mines', ...plan.points[0], explicit, points: plan.points, laid: 0};
+    ship.path = []; ship.pathTarget = null; ship.navigation = null; ship.mineActionAt = this.state.time;
+  }
+
+  commandSweep(ids, point) {
+    if (this.state.result) return {ok: false, reason: 'Battle has ended'};
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || !this._segmentClear(point, point, .25)) return {ok: false, reason: 'Sweep operations require navigable water inside the chart'};
+    const ships = this._orderedShips(ids).filter(s => roleIs(s, 'minesweeper'));
+    if (!ships.length) return {ok: false, reason: 'Select a friendly minesweeper'};
+    if (ships.some(s => !this._route(s, point).length)) return {ok: false, reason: 'No navigable route to the clearance area'};
+    for (const ship of ships) { ship.avoidance = null; ship.stationNavigation = null; ship.stationResponseKey = null; ship.order = {type: 'sweep', ...point, explicit: true}; ship.path = []; ship.pathTarget = null; ship.navigation = null; ship.mineSweepTargetId = null; ship.mineSweepProgress = 0; }
+    return {ok: true, reason: ''};
+  }
+
+  _layMine(ship, point) {
+    if (!alive(ship) || ship.mineAmmo <= 0 || !this._segmentClear(point, point, .25)) return false;
+    const mine = MINE_TYPES[this.config.era];
+    this.state.mines.push({id: this._id('mine'), side: ship.side, sourceId: ship.id, weaponId: mine.id, x: point.x, y: point.y, status: 'active', armedAt: this.state.time + mine.armingDelay, detectedBy: {blue: ship.side === 'blue', red: ship.side === 'red'}});
+    ship.mineAmmo--;
+    return true;
+  }
+
+  _thinkMineSupport(ship, objective, leader) {
+    if (['lay_mines', 'sweep'].includes(ship.order.type)) return true;
+    if (ship.order.explicit || !roleIs(ship, 'minelayer', 'minesweeper')) return false;
+    if (roleIs(ship, 'minelayer')) {
+      if (ship.side === 'red' && ship.mineAmmo > 0 && (ship.mineDeployments || 0) < 2) {
+        const bearing = angle(this.map.spawns.red, this.map.spawns.blue);
+        const point = this._nearestWater({x: ship.x + Math.cos(bearing) * 13, y: ship.y + Math.sin(bearing) * 13});
+        const plan = this._minePlan(ship, point);
+        if (plan.ok) { this._beginMineOrder(ship, plan, false); ship.tactics = 'Laying defensive mine line'; return true; }
+      }
+      ship.navigation = this.map.spawns[ship.side]; ship.tactics = 'Mine warfare reserve'; return true;
+    }
+    const known = this.getVisibleMines(ship.side).filter(m => m.side !== ship.side).sort((a, b) => distance(a, ship) - distance(b, ship))[0];
+    if (known) { ship.order = {type: 'sweep', x: known.x, y: known.y, explicit: false}; ship.navigation = null; ship.tactics = 'Clearing detected mines'; return true; }
+    ship.navigation = leader && leader.id !== ship.id ? {x: leader.x, y: leader.y} : objective;
+    ship.tactics = 'Mine countermeasures escort'; return true;
+  }
+
+  _updateMines(dt) {
+    const active = this.state.ships.filter(s => alive(s) && !roleIs(s, 'coastal'));
+    for (const ship of active) {
+      if (ship.order.type === 'lay_mines' && distance(ship, ship.order) < .3 && this.state.time >= ship.mineActionAt) {
+        if (this._layMine(ship, {x: ship.x, y: ship.y})) {
+          ship.order.laid++; ship.mineActionAt = this.state.time + 45;
+          const next = ship.order.points[ship.order.laid];
+          if (next && ship.mineAmmo > 0) { ship.order.x = next.x; ship.order.y = next.y; ship.pathTarget = null; }
+          else { ship.mineDeployments = (ship.mineDeployments || 0) + 1; ship.order = {type: 'hold', explicit: ship.order.explicit}; ship.path = []; ship.pathTarget = null; }
+        }
+      }
+      const detection = ship.classData.mineDetectionRange || 0;
+      if (!detection) continue;
+      for (const mine of this.state.mines) if (mine.status === 'active' && !mine.detectedBy[ship.side] && distance(ship, mine) <= detection && this._segmentClear(ship, mine, 0)) {
+        mine.detectedBy[ship.side] = true;
+        this._event(`${ship.name} detected a hostile mine`, ship.side, 'private');
+      }
+      if (ship.order.type !== 'sweep') { ship.mineSweepTargetId = null; ship.mineSweepProgress = 0; continue; }
+      const target = this.getVisibleMines(ship.side).filter(m => m.side !== ship.side && distance(m, ship.order) < 6 && distance(ship, m) <= ship.classData.mineSweepRange && this._segmentClear(ship, m, 0)).sort((a, b) => distance(a, ship) - distance(b, ship))[0];
+      if (!target) {
+        ship.mineSweepTargetId = null; ship.mineSweepProgress = 0;
+        if (!ship.order.explicit && !this.getVisibleMines(ship.side).some(m => m.side !== ship.side && distance(m, ship.order) < 6)) ship.order = {type: 'auto', explicit: false};
+        continue;
+      }
+      if (ship.mineSweepTargetId !== target.id) { ship.mineSweepTargetId = target.id; ship.mineSweepProgress = 0; }
+      ship.mineSweepProgress += dt;
+      if (ship.mineSweepProgress >= ship.classData.mineSweepSeconds) {
+        target.status = 'swept'; ship.mineSweepTargetId = null; ship.mineSweepProgress = 0;
+        this._event(`${ship.name} cleared a mine`, ship.side, 'private');
+      }
+    }
+    for (const mine of this.state.mines) {
+      if (mine.status !== 'active' || this.state.time < mine.armedAt) continue;
+      const weapon = MINE_TYPES[mine.weaponId];
+      // Friendly mine charts abstract safe lane following; there is deliberately no random friendly fire.
+      const victim = active.find(ship => ship.side !== mine.side && alive(ship) && distance(ship, mine) <= weapon.triggerRadius && mineCanTrigger(ship, weapon) && this._segmentClear(ship, mine, 0));
+      if (!victim) continue;
+      mine.status = 'detonated'; mine.detectedBy[victim.side] = true;
+      this._damage(victim, weapon.damage, weapon, mine.side);
+      if (victim.side === 'blue' || victim.detectedBy.blue) this._effect('impact', victim, 1, 4);
+      this._event(`${victim.name} struck a mine`, victim.side, 'observed', victim);
+    }
+    this.state.mines = this.state.mines.filter(mine => mine.status === 'active');
+    for (const ship of active) if (ship.mineSweepTargetId && !this.state.mines.some(mine => mine.id === ship.mineSweepTargetId)) { ship.mineSweepTargetId = null; ship.mineSweepProgress = 0; }
   }
 
   setManualShip(id = null) {
     const chosen = id ? this.getShip(id) : null;
     this.singleManualId = chosen && chosen.side === 'blue' && alive(chosen) ? id : null;
-    for (const s of this.state.ships) {
-      const wasManual = s.manual;
-      s.manual = s.id === this.singleManualId;
-      if (wasManual && !s.manual) {
-        if (s.order.temporaryManualHold) {
-          s.order = s.orderBeforeManual ? clone(s.orderBeforeManual) : {type: 'auto', explicit: false};
-          s.path = []; s.navigation = null; s.pathTarget = null;
-        }
-        s.orderBeforeManual = null;
-      }
-      if (s.manual && !wasManual && !s.order.explicit) {
-        s.orderBeforeManual = clone(s.order);
-        s.order = {type: 'hold', explicit: true, temporaryManualHold: true};
-        s.path = []; s.navigation = null; s.pathTarget = null;
-      }
-    }
+    // Selection controls weapons only. Existing movement, route and inertia
+    // remain exactly as they were until a player issues a new order.
+    for (const s of this.state.ships) s.manual = s.id === this.singleManualId;
   }
 
   commandMove(ids, point, formation = 'line') {
     if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return {ok: false, reason: 'Invalid coordinates'};
-    const ships = this._orderedShips(ids);
-    if (!ships.length) return {ok: false, reason: 'Select an operational friendly ship'};
+    const ships = this._orderedShips(ids).filter(s => !roleIs(s, 'coastal'));
+    if (!ships.length) return {ok: false, reason: 'Select an operational mobile ship; coastal batteries cannot move'};
     this.setFormation(ids, formation);
     const center = ships.reduce((p, s) => ({x: p.x + s.x / ships.length, y: p.y + s.y / ships.length}), {x: 0, y: 0});
     const heading = angle(center, point);
@@ -173,7 +341,19 @@ export class NavalGame {
     for (const {ship, target, path} of plans) {
       ship.order = {type: 'move', ...target, explicit: true}; ship.path = path; ship.pathTarget = target; ship.navigation = null;
       ship.routeFailed = false; ship.routeAttemptTime = this.state.time;
+      ship.avoidance = null; ship.stationNavigation = null; ship.stationResponseKey = null; ship.stationResponseAt = 0;
     }
+    return {ok: true, reason: ''};
+  }
+
+  commandDepth(ids, meters) {
+    if (this.state.result) return {ok: false, reason: 'Battle has ended'};
+    if (typeof meters !== 'number' || !Number.isFinite(meters)) return {ok: false, reason: 'Enter a finite depth in metres'};
+    const ships = this._orderedShips(ids).filter(isSubmarine);
+    if (!ships.length) return {ok: false, reason: 'Select an operational friendly submarine'};
+    const maximum = Math.min(...ships.map(ship => depthProfile(ship).maxDepthMeters));
+    if (meters < 0 || meters > maximum) return {ok: false, reason: `Depth must be between 0 and ${maximum} m for the selected submarines`};
+    for (const ship of ships) { ship.orderedDepthMeters = meters; ship.depthOrderExplicit = true; ship.depthBlocked = false; }
     return {ok: true, reason: ''};
   }
 
@@ -184,18 +364,18 @@ export class NavalGame {
     if (!ships.length) return {ok: false, reason: 'Select an operational friendly ship'};
     const reason = this._targetCheck(ships[0], target);
     if (reason) return {ok: false, reason};
-    for (const s of ships) { s.order = {type: 'attack', targetId, explicit: true}; s.path = []; s.pathTarget = null; s.navigation = null; }
+    for (const s of ships) { s.avoidance = null; s.stationNavigation = null; s.stationResponseKey = null; s.order = {type: 'attack', targetId, explicit: true}; s.path = []; s.pathTarget = null; s.navigation = null; }
     return {ok: true, reason: ''};
   }
 
   _orderedShips(ids) { return [...new Set(ids || [])].map(id => this.getShip(id)).filter(s => s && alive(s) && s.side === 'blue'); }
   setFormation(ids, formation) {
-    const ships = this._orderedShips(ids), pace = Math.min(...ships.map(s => s.maxSpeed));
+    const ships = this._orderedShips(ids).filter(s => !roleIs(s, 'coastal')), pace = Math.min(...ships.map(s => s.maxSpeed));
     for (const s of ships) { s.formation = ['line', 'column', 'wedge', 'screen'].includes(formation) ? formation : 'line'; s.formationSpeed = ships.length > 1 ? pace : null; }
   }
   setStance(ids, stance) { for (const s of this._orderedShips(ids)) s.stance = ['balanced', 'aggressive', 'conserve'].includes(stance) ? stance : 'balanced'; }
   setEmcon(ids, enabled) { for (const s of this._orderedShips(ids)) s.emcon = Boolean(enabled); }
-  stop(ids) { for (const s of this._orderedShips(ids)) { s.order = {type: 'hold', explicit: true}; s.path = []; s.pathTarget = null; s.navigation = null; } }
+  stop(ids) { for (const s of this._orderedShips(ids)) { s.avoidance = null; s.stationNavigation = null; s.stationResponseKey = null; s.order = {type: 'hold', explicit: true}; s.path = []; s.pathTarget = null; s.navigation = null; } }
 
   _formationOffset(i, count, formation) {
     if (count === 1) return {x: 0, y: 0};
@@ -240,7 +420,19 @@ export class NavalGame {
 
   getVisibleShips(side = 'blue') { return this.state.ships.filter(s => s.status !== 'sunk' && (s.side === side || s.detectedBy[side])); }
   getThreats(side = 'blue') { return this.state.projectiles.filter(p => p.status === 'active' && !p.retired && p.hp > 0 && p.side !== side && isThreat(p) && this._projectileVisible(p, side)); }
-  _projectileVisible(p, side) { return this.state.ships.some(s => s.side === side && alive(s) && distance(s, p) < (p.kind === 'torpedo' ? Math.max(1.5, s.sonar * .5) : Math.max(s.visual, s.emcon ? s.visual : s.radar * .65))); }
+  _surfaceSensors(ship) {
+    if (!isSubmerged(ship)) return {visual: ship.visual, radar: ship.emcon ? 0 : ship.radar};
+    return {visual: ship.depthMeters <= depthProfile(ship).periscopeDepthMeters ? Math.min(3, ship.visual * .5) : 0, radar: 0};
+  }
+
+  _projectileVisible(p, side) {
+    return this.state.ships.some(s => {
+      if (s.side !== side || !alive(s)) return false;
+      const sensors = this._surfaceSensors(s);
+      const range = ['torpedo', 'depthcharge'].includes(p.kind) ? Math.max(1.5, s.sonar * .5) : Math.max(sensors.visual, sensors.radar * .65);
+      return distance(s, p) < range;
+    });
+  }
   _event(text, side, visibility = 'public', subject = null) {
     // The event log is player-facing; hostile logistics and unseen losses stay private.
     if (side === 'red' && (visibility === 'private' || visibility === 'observed' && !subject?.detectedBy?.blue)) return;
@@ -252,6 +444,8 @@ export class NavalGame {
   _onLand(point, padding = 0) {
     if (point.x < padding || point.y < padding || point.x > this.map.width - padding || point.y > this.map.height - padding) return true;
     for (const shape of this.map.land || []) {
+      const bounds = this._landBounds(shape);
+      if (point.x < bounds.minX - padding || point.x > bounds.maxX + padding || point.y < bounds.minY - padding || point.y > bounds.maxY + padding) continue;
       const pts = shape.points || [];
       let inside = false;
       for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
@@ -284,6 +478,8 @@ export class NavalGame {
       return (p.x - q.x - t * dx) ** 2 + (p.y - q.y - t * dy) ** 2;
     };
     for (const shape of this.map.land || []) {
+      const bounds = this._landBounds(shape);
+      if (Math.max(a.x, b.x) < bounds.minX - margin || Math.min(a.x, b.x) > bounds.maxX + margin || Math.max(a.y, b.y) < bounds.minY - margin || Math.min(a.y, b.y) > bounds.maxY + margin) continue;
       const points = shape.points;
       for (let i = 0; i < points.length; i++) {
         const c = {x: points[i][0], y: points[i][1]}, next = points[(i + 1) % points.length], d = {x: next[0], y: next[1]};
@@ -359,48 +555,9 @@ export class NavalGame {
     s.routeFailed = !s.path.length; s.routeAttemptTime = this.state.time;
   }
 
-  _moveShip(s, dt) {
-    let destination = null;
-    if (s.order.type === 'move') destination = s.order;
-    else if (!s.manual && s.navigation) destination = s.navigation;
-    if (destination) this._navigate(s, destination);
-    else s.path = [];
-    while (s.path.length && distance(s, s.path[0]) < .22) s.path.shift();
-    let wantedSpeed = 0;
-    if (s.path.length) {
-      const waypoint = s.path[0];
-      let wantedHeading = angle(s, waypoint);
-      let avoidance = 0;
-      for (const other of this.state.ships) {
-        if (other.id === s.id || other.status !== 'active') continue;
-        const d = distance(s, other);
-        if (d > .8 || d < .00001) continue;
-        const relative = wrap(angle(s, other) - s.heading);
-        if (Math.abs(relative) < Math.PI * .6) avoidance += (relative >= 0 ? -1 : 1) * (.8 - d) * 1.7;
-      }
-      wantedHeading += clamp(avoidance, -1.1, 1.1);
-      const turn = s.classData.turnRate * Math.PI / 180 * dt;
-      s.heading = wrap(s.heading + clamp(wrap(wantedHeading - s.heading), -turn, turn));
-      const error = Math.abs(wrap(wantedHeading - s.heading));
-      wantedSpeed = s.maxSpeed * (error > 1.5 ? .2 : error > .65 ? .55 : 1) * (.55 + .45 * s.hp / s.maxHp);
-      if (s.formationSpeed) wantedSpeed = Math.min(wantedSpeed, s.formationSpeed);
-      const probe = {x: s.x + Math.cos(s.heading) * Math.max(.5, wantedSpeed * 20), y: s.y + Math.sin(s.heading) * Math.max(.5, wantedSpeed * 20)};
-      if (!this._segmentClear(s, probe, .1)) {
-        wantedSpeed = 0;
-        if (!this._segmentClear(s, waypoint, .16) && this.state.time - (s.routeAttemptTime || 0) > 5) s.pathTarget = null;
-        // A slow pivot is permitted even in manual mode as collision avoidance.
-        s.heading = wrap(s.heading + clamp(wrap(angle(s, waypoint) - s.heading), -turn, turn));
-      }
-    } else if (s.order.type === 'move' && destination && distance(s, destination) < .5) {
-      s.order = {type: 'hold', explicit: Boolean(s.order.explicit)}; s.pathTarget = null;
-    }
-    const accel = s.maxSpeed / 24;
-    s.speed += clamp(wantedSpeed - s.speed, -accel * dt * 2, accel * dt);
-    if (s.speed < 1e-7) s.speed = 0;
-    const next = {x: s.x + Math.cos(s.heading) * s.speed * dt, y: s.y + Math.sin(s.heading) * s.speed * dt};
-    if (this._segmentClear(s, next, .08)) { s.x = next.x; s.y = next.y; }
-    else { s.speed = 0; s.pathTarget = null; }
-  }
+  _moveShips(dt) { advanceFleet(this, dt); }
+
+  _moveShip(s, dt) { advanceFleet(this, dt, [s]); }
 
   _updateSensors() {
     const ships = this.state.ships.filter(alive);
@@ -410,11 +567,13 @@ export class NavalGame {
       for (const target of ships) {
         if (observer.side === target.side) continue;
         const d = distance(observer, target);
-        const submarine = roleIs(target, 'submarine');
+        const submarine = isSubmarine(target), sensors = this._surfaceSensors(observer);
         const firing = this.state.time - (target.lastFired ?? -999) < 18;
-        let range = submarine ? observer.sonar * (.6 + target.speed / Math.max(target.maxSpeed, .001) * .55) : Math.max(observer.visual, observer.emcon ? 0 : Math.min(observer.radar, this.config.era === 'modern' ? 40 : 26) * Math.sqrt(Math.max(.15, target.signature)) * (target.emcon ? .82 : 1));
-        if (firing) range = Math.max(range, Math.min(observer.visual * 1.25, this.config.era === 'modern' ? 40 : 30));
-        const lineClear = d < 1.5 || this._segmentClear(observer, target, 0);
+        const acoustic = observer.sonar * (.6 + target.speed / Math.max(target.maxSpeed, .001) * .55);
+        const surface = Math.max(sensors.visual, Math.min(sensors.radar, this.config.era === 'modern' ? 40 : 26) * Math.sqrt(Math.max(.15, target.signature)) * (target.emcon ? .82 : 1));
+        let range = submarine ? Math.max(acoustic, isSubmerged(target) ? 0 : surface) : Math.max(surface, isSubmarine(observer) && !roleIs(target, 'coastal') ? acoustic * .8 : 0);
+        if (firing && !isSubmerged(target) && sensors.visual > 0) range = Math.max(range, Math.min(sensors.visual * 1.25, this.config.era === 'modern' ? 40 : 30));
+        const lineClear = d < 1.5 || this._segmentClear(observer.shorePoint || observer, target.shorePoint || target, 0);
         if (d <= range && lineClear) { contacts.push(target.id); observer.lastContact[target.id] = this.state.time; }
       }
       observer.localContacts = contacts;
@@ -424,7 +583,7 @@ export class NavalGame {
       const carrier = this.getShip(aircraft.carrierId);
       if (!carrier || !alive(carrier)) continue;
       const radius = this.config.era === 'modern' ? 32 : 16;
-      for (const target of ships) if (target.side !== aircraft.side && !roleIs(target, 'submarine') && distance(aircraft, target) < radius && !carrier.localContacts.includes(target.id)) carrier.localContacts.push(target.id);
+      for (const target of ships) if (target.side !== aircraft.side && !isSubmerged(target) && distance(aircraft, target) < radius && !carrier.localContacts.includes(target.id)) carrier.localContacts.push(target.id);
     }
     // Connected communication components share tracks, without global omniscience.
     for (const side of ['blue', 'red']) {
@@ -440,12 +599,12 @@ export class NavalGame {
       }
     }
     for (const s of this.state.ships) if (s.status === 'sinking') {
-      for (const side of ['blue', 'red']) if (ships.some(observer => observer.side === side && distance(observer, s) < observer.visual * 1.5)) s.detectedBy[side] = true;
+      for (const side of ['blue', 'red']) if (ships.some(observer => observer.side === side && distance(observer, s) < (isSubmerged(s) ? observer.sonar * .6 : this._surfaceSensors(observer).visual * 1.5))) s.detectedBy[side] = true;
     }
   }
 
   _targetCategory(target) {
-    if (target.classData) return roleIs(target, 'submarine') ? 'submarine' : 'surface';
+    if (target.classData) return roleIs(target, 'coastal') ? 'objective' : roleIs(target, 'submarine') ? 'submarine' : 'surface';
     if (target.weaponId) return target.kind === 'aircraft' ? 'air' : 'projectile';
     return 'objective';
   }
@@ -470,7 +629,9 @@ export class NavalGame {
     const targetReason = this._targetCheck(ship, target);
     if (targetReason) return targetReason;
     const category = this._targetCategory(target);
-    if (!weapon.targets.includes(category)) return 'Weapon incompatible with this target';
+    if (!(isSubmarine(target) ? depthTargetCompatible(target, weapon) : weapon.targets.includes(category))) return 'Weapon incompatible with this target';
+    const depthReason = depthWeaponRestriction(ship, weapon);
+    if (depthReason) return depthReason;
     if (target.kind === 'torpedo' && ['sam', 'aa', 'ciws', 'aircraft'].includes(weapon.kind)) return 'This weapon cannot intercept underwater torpedoes';
     const d = distance(ship, target);
     if (d > weapon.range) return `Beyond weapon range (${weapon.range} km)`;
@@ -527,9 +688,9 @@ export class NavalGame {
       return;
     }
     if (target.classData && !alive(target)) return;
-    const penetration = ['torpedo', 'depthcharge'].includes(weapon.kind) ? .15 : ['missile', 'aircraft'].includes(weapon.kind) ? .4 : .85;
+    const penetration = weapon.kind === 'collision' ? .25 : ['torpedo', 'depthcharge', 'mine'].includes(weapon.kind) ? .15 : ['missile', 'aircraft'].includes(weapon.kind) ? .4 : .85;
     const mitigation = target.classData ? clamp((target.armor || 0) * penetration, 0, .8) : .1;
-    const damage = Math.max(1, rawDamage * (1 - mitigation));
+    const damage = Math.max(1, rawDamage * (1 - mitigation) * .9);
     target.hp = Math.max(0, target.hp - damage);
     if (target.classData) {
       target.lastDamageTime = this.state.time;
@@ -540,11 +701,12 @@ export class NavalGame {
   _sink(ship, sourceSide) {
     if (ship.status !== 'active') return;
     ship.status = 'sinking'; ship.hp = 0; ship.speed = 0; ship.path = []; ship.navigation = null;
-    ship.sinkDuration = clamp(24 + (ship.classData.tonnage || 2000) / 1600, 24, 65); ship.sinkTimer = ship.sinkDuration;
+    ship.verticalSpeed = 0; ship.orderedDepthMeters = ship.depthMeters; ship.depthBlocked = false;
+    ship.sinkDuration = clamp(48 + (ship.classData.tonnage || 2000) / 1200, 48, 120); ship.sinkTimer = ship.sinkDuration;
     ship.order = {type: 'disabled', explicit: false};
     if (ship.manual) this.setManualShip(null);
     this._effect('explosion', ship, 1.6, 8);
-    this._event(`${ship.side === 'blue' ? 'Friendly' : 'Enemy'} ${ship.name} is critically damaged and sinking`, ship.side, 'observed', ship);
+    this._event(`${ship.side === 'blue' ? 'Friendly' : 'Enemy'} ${ship.name} ${roleIs(ship, 'coastal') ? 'has been disabled' : 'is critically damaged and sinking'}`, ship.side, 'observed', ship);
     if (sourceSide && sourceSide !== ship.side && this.config.mode !== 'island_control') this.state.score[sourceSide] += VALUE[ship.classData.role] || 2;
   }
 
@@ -562,6 +724,7 @@ export class NavalGame {
 
   _hit(p, target) {
     const weapon = WEAPONS[p.weaponId];
+    if (isSubmarine(target) && !depthTargetCompatible(target, weapon)) { this._effect('splash', p, .5, 2); return; }
     let probability = p.accuracy;
     // Long-range shellfire needs ranging corrections; maximum range is not maximum accuracy.
     if (p.kind === 'gun') probability *= clamp(1 - .65 * (p.travelled / Math.max(1, weapon.range)) ** 2, .25, 1);
@@ -576,9 +739,10 @@ export class NavalGame {
   }
 
   _canTrack(p, target) {
+    if (isSubmarine(target) && !depthTargetCompatible(target, WEAPONS[p.weaponId])) return false;
     if (!target.classData && !target.weaponId) return true; // Fixed, charted installations.
     let seeker = p.kind === 'torpedo' ? 6 : p.kind === 'aircraft' ? (this.config.era === 'modern' ? 32 : 16) : p.kind === 'sam' ? 12 : 24;
-    if (target.classData && roleIs(target, 'submarine')) seeker = Math.min(seeker, 6);
+    if (isSubmerged(target)) seeker = Math.min(seeker, 6);
     if (distance(p, target) <= seeker && (p.kind !== 'torpedo' || this._segmentClear(p, target, 0))) return true;
     if (p.kind === 'torpedo') return false;
     const source = this.getShip(p.sourceId);
@@ -768,7 +932,7 @@ export class NavalGame {
       if (!choice) continue;
       if (mount.fireControlTargetId !== choice.target.id) {
         mount.fireControlTargetId = choice.target.id;
-        mount.solutionReadyAt = this.state.time + (w.kind === 'gun' ? (this.config.era === 'modern' ? 8 : 12) : w.kind === 'torpedo' ? 35 : w.kind === 'aircraft' ? 45 : 25);
+        mount.solutionReadyAt = this.state.time + (w.acquisitionTime || 30);
       }
       if (this.state.time + 1e-8 >= mount.solutionReadyAt) candidates.push(choice);
     }
@@ -780,9 +944,50 @@ export class NavalGame {
   }
 
   _combatRange(ship, target) {
-    const weapons = ship.mounts.filter(m => m.ammo > 0 && WEAPONS[m.weaponId].targets.includes(target && !target.classData ? 'objective' : target?.classData && roleIs(target, 'submarine') ? 'submarine' : 'surface')).map(m => WEAPONS[m.weaponId]);
+    const weapons = ship.mounts.filter(m => m.ammo > 0 && (target && isSubmarine(target) ? depthTargetCompatible(target, WEAPONS[m.weaponId]) : WEAPONS[m.weaponId].targets.includes(target ? this._targetCategory(target) : 'surface'))).map(m => WEAPONS[m.weaponId]);
     const preferred = roleIs(ship, 'submarine') ? weapons.filter(w => w.kind === 'torpedo') : weapons.filter(w => w.kind !== 'aircraft');
     return Math.max(weapons.length ? .3 : 2, ...(preferred.length ? preferred : weapons).map(w => w.kind === 'missile' && target?.classData ? Math.min(w.range * .65, Math.max(24, Math.min(ship.radar * .8, 38))) : w.range * .7));
+  }
+
+  _planSubmarineDepth(ship, targets = []) {
+    if (!isSubmarine(ship) || !alive(ship) || ship.manual || ship.side === 'blue' && ship.depthOrderExplicit) return;
+    const profile = depthProfile(ship);
+    // Decisions use this boat's known contacts and genuinely visible ordnance.
+    const known = ship.localContacts.map(id => this.getShip(id)).filter(t => t && alive(t) && t.side !== ship.side && t.detectedBy[ship.side]);
+    const incoming = this.state.projectiles.some(p => p.side !== ship.side && p.status === 'active' &&
+      ['torpedo', 'depthcharge', 'aircraft'].includes(p.kind) && WEAPONS[p.weaponId]?.targets.includes('submarine') &&
+      distance(ship, p) < (p.kind === 'aircraft' ? 10 : 3) && this._projectileVisible(p, ship.side));
+    const closeASW = ship.side === 'red' && known.some(t => t.classData.weapons.some(m => {
+      const w = WEAPONS[m.weaponId];
+      return w.targets.includes('submarine') && distance(ship, t) < Math.min(6, w.range * .8);
+    }));
+    const evasive = incoming || closeASW;
+    const defensiveDepth = Math.min(profile.maxDepthMeters * .75, Math.max(profile.defaultDepthMeters * 1.7, profile.periscopeDepthMeters + 20));
+    if (evasive) {
+      if (Math.abs(ship.orderedDepthMeters - defensiveDepth) > 2) {
+        ship.orderedDepthMeters = defensiveDepth; ship.depthDecisionAt = this.state.time + 60;
+      }
+      return;
+    }
+    if (this.state.time < ship.depthDecisionAt) return;
+    let desired = profile.defaultDepthMeters;
+    const visibleTargets = targets.filter(t => !this._targetCheck(ship, t) && (!t.classData || ship.localContacts.includes(t.id)));
+    const options = [];
+    for (const target of visibleTargets) for (const mount of ship.mounts) {
+      const weapon = WEAPONS[mount.weaponId], range = distance(ship, target);
+      if (mount.ammo <= 0 || mount.cooldown > 1 || this.state.time + 45 < (mount.nextSalvoAt || 0) ||
+        range > weapon.range || range < (weapon.minRange || 0) ||
+        !(isSubmarine(target) ? depthTargetCompatible(target, weapon) : weapon.targets.includes(this._targetCategory(target)))) continue;
+      if (['torpedo', 'depthcharge'].includes(weapon.kind) && !this._segmentClear(ship, target, 0)) continue;
+      const limit = weaponLaunchDepth(ship, weapon);
+      options.push({depth: Math.min(profile.defaultDepthMeters, Math.max(0, limit - 1)), score: (weapon.kind === 'torpedo' ? 2 : 1) * this._targetPriority(ship, target)});
+    }
+    // Friendly boats use the first workable mount; enemy boats rank options
+    // and anticipate close ASW platforms as well as visible incoming weapons.
+    if (ship.side === 'red') options.sort((a, b) => b.score - a.score);
+    if (options.length) desired = options[0].depth;
+    if (Math.abs(desired - ship.orderedDepthMeters) > 2) ship.orderedDepthMeters = desired;
+    ship.depthDecisionAt = this.state.time + (ship.side === 'red' ? 45 : 60);
   }
 
   _think(side) {
@@ -801,7 +1006,10 @@ export class NavalGame {
       else targets.sort((a, b) => this._targetPriority(ship, b) - this._targetPriority(ship, a));
       const objectiveAttack = objective?.id && objective.hp > 0 && objective.owner !== side && objective.kind !== 'exit' && this.config.mode !== 'island_control';
       if (!specified && objectiveAttack && ['port_defense', 'port_assault'].includes(this.config.mode)) targets.push(objective);
+      this._planSubmarineDepth(ship, targets);
       this._attackAutonomously(ship, targets);
+      if (roleIs(ship, 'coastal')) { ship.navigation = null; ship.tactics = 'Coastal fire support'; return; }
+      if (this._thinkMineSupport(ship, objective, leader)) return;
       if (ship.order.type === 'move' || ship.order.type === 'hold' && ship.order.explicit) return;
       const target = specified && (!specified.classData || specified.detectedBy[side]) ? specified : targets.find(t => t.classData) || (objectiveAttack && ['port_defense', 'port_assault'].includes(this.config.mode) ? objective : null);
       if (ship.convoy) { ship.navigation = this.convoyGoal; return; }
@@ -848,7 +1056,7 @@ export class NavalGame {
     const active = this.state.ships.filter(alive);
     if (this.config.mode === 'island_control') {
       for (const objective of this.state.objectives.filter(o => o.kind === 'island' && o.hp > 0)) {
-        const nearby = active.filter(s => !roleIs(s, 'submarine', 'supply', 'carrier') && distance(s, objective) < 5);
+        const nearby = active.filter(s => !roleIs(s, 'submarine', 'supply', 'carrier', 'coastal', 'minelayer', 'minesweeper') && distance(s, objective) < 5);
         const power = {blue: 0, red: 0};
         for (const ship of nearby) power[ship.side] += roleIs(ship, 'amphibious') ? 3 : 1;
         const challenger = power.blue > 0 && power.red === 0 ? 'blue' : power.red > 0 && power.blue === 0 ? 'red' : null;
@@ -869,9 +1077,9 @@ export class NavalGame {
   }
 
   _remainingPower(side) {
-    const ships = this.state.ships.filter(s => s.side === side && !roleIs(s, 'supply'));
+    const ships = this.state.ships.filter(s => s.side === side && !roleIs(s, 'supply', 'coastal'));
     const original = ships.reduce((sum, ship) => sum + (VALUE[ship.classData.role] || 2), 0);
-    if (!original) return this.state.ships.some(s => s.side === side && alive(s)) ? 1 : 0;
+    if (!original) return this.state.ships.some(s => s.side === side && alive(s) && !roleIs(s, 'coastal')) ? 1 : 0;
     return ships.reduce((sum, ship) => sum + (alive(ship) ? (VALUE[ship.classData.role] || 2) * (.4 + .6 * ship.hp / ship.maxHp) : 0), 0) / original;
   }
 
@@ -896,7 +1104,7 @@ export class NavalGame {
 
   _checkVictory() {
     if (this.state.result) return;
-    const active = this.state.ships.filter(alive), blue = active.filter(s => s.side === 'blue'), red = active.filter(s => s.side === 'red');
+    const active = this.state.ships.filter(s => alive(s) && !roleIs(s, 'coastal')), blue = active.filter(s => s.side === 'blue'), red = active.filter(s => s.side === 'red');
     const mode = this.config.mode;
     const bluePort = this.state.objectives.find(o => o.kind === 'port' && o.initialOwner === 'blue');
     const redPort = this.state.objectives.find(o => o.kind === 'port' && o.initialOwner === 'red');
@@ -947,7 +1155,7 @@ export class NavalGame {
         this.state.effects = this.state.effects.filter(e => e.ttl > 0);
         continue;
       }
-      this.state.time += step;
+      this.state.time = Math.min(this.config.duration, this.state.time + step);
       for (const ship of this.state.ships) {
         if (ship.status === 'sinking') { ship.sinkTimer = Math.max(0, ship.sinkTimer - step); if (ship.sinkTimer === 0) ship.status = 'sunk'; continue; }
         if (!alive(ship)) continue;
@@ -959,7 +1167,7 @@ export class NavalGame {
         }
       }
       this._sensorClock -= step;
-      if (this._sensorClock <= 1e-8) { this._updateSensors(); this._sensorClock += 2; }
+      if (this._sensorClock <= 1e-8) { this._updateSensors(); this._updateMines(2); this._sensorClock += 2; }
       this._defenseClock -= step;
       if (this._defenseClock <= 1e-8) {
         for (const ship of this.state.ships) if (alive(ship)) this._defend(ship);
@@ -969,7 +1177,7 @@ export class NavalGame {
         this._aiClock[side] -= step;
         if (this._aiClock[side] <= 1e-8) { this._think(side); this._aiClock[side] += side === 'red' ? 2 : 5; }
       }
-      for (const ship of this.state.ships) if (alive(ship)) this._moveShip(ship, step);
+      this._moveShips(step);
       for (const projectile of [...this.state.projectiles]) this._stepProjectile(projectile, step);
       this.state.projectiles = this.state.projectiles.filter(p => p.status === 'active');
       for (const effect of this.state.effects) effect.ttl -= step;
@@ -993,7 +1201,7 @@ export class NavalGame {
     game.config = data.config; game.map = data.map; game.state = data.state;
     game._seed = data.seed >>> 0; game._nextId = data.nextId; game._sensorClock = data.sensorClock; game._aiClock = data.aiClock;
     game._objectiveClock = data.objectiveClock; game._defenseClock = data.defenseClock ?? 0; game._accumulator = data.accumulator || 0; game.singleManualId = data.singleManualId; game.convoyIds = data.convoyIds; game.convoyGoal = data.convoyGoal;
-    game._gridCache = null; game._salvoReservations = {};
+    game._gridCache = null; game._terrainBounds = new WeakMap(); game._salvoReservations = {};
     return game;
   }
 }
@@ -1013,6 +1221,7 @@ function validateSnapshot(data) {
   check(['small', 'standard', 'large'].includes(config.scale), 'unknown fleet scale');
   check(FACTIONS.some(f => f.id === config.blueFaction) && FACTIONS.some(f => f.id === config.redFaction), 'unknown faction');
   check(MAPS.some(m => m.id === config.mapId), 'unknown map');
+  if (config.balanceVersion >= 3) check(number(config.durationHours, 2, 24) && config.duration === config.durationHours * 3600, 'operation deadline must match the selected 2-24 hour duration');
   check(number(config.duration, .1) && number(config.captureTarget, .1) && number(config.seed, 0, Number.MAX_SAFE_INTEGER), 'invalid scenario timing or seed');
   check(number(map.width, 1, 2000) && number(map.height, 1, 2000), 'map dimensions out of bounds');
   const point = (p, padding = 0) => object(p) && number(p.x, -padding, map.width + padding) && number(p.y, -padding, map.height + padding);
@@ -1023,6 +1232,8 @@ function validateSnapshot(data) {
     const points = array(land.points, 2048, 'polygon vertices'); vertices += points.length;
     check(points.length >= 3 && vertices <= 16384 && points.every(p => Array.isArray(p) && p.length === 2 && number(p[0], 0, map.width) && number(p[1], 0, map.height)), 'invalid polygon coordinates');
   }
+  const geometry = Object.create(NavalGame.prototype); geometry.map = map; geometry._terrainBounds = new WeakMap();
+  if (state.mines === undefined) state.mines = [];
   check(number(state.time) && object(state.score) && number(state.score.blue) && number(state.score.red), 'invalid battle clock or score');
   check(state.result === null || object(state.result) && ['blue', 'red', 'draw'].includes(state.result.winner) && string(state.result.reason, 2048), 'invalid battle outcome');
   check(integer(data.seed, 0, 4294967295) && integer(data.nextId, 1, 1e9), 'invalid random state or ID counter');
@@ -1032,17 +1243,26 @@ function validateSnapshot(data) {
   const ids = new Set(), shipIds = new Set();
   const unique = (id, label) => { check(string(id, 128) && !ids.has(id), 'invalid or duplicate ' + label + ' ID'); ids.add(id); };
   const reference = id => id === null || id === undefined || string(id, 128);
-  const order = value => object(value) && ['auto', 'hold', 'move', 'attack', 'disabled'].includes(value.type) && typeof value.explicit === 'boolean' && (value.type !== 'move' || point(value)) && (value.type !== 'attack' || string(value.targetId, 128)) && (value.temporaryManualHold === undefined || typeof value.temporaryManualHold === 'boolean');
+  const order = value => object(value) && ['auto', 'hold', 'move', 'attack', 'disabled', 'lay_mines', 'sweep'].includes(value.type) && typeof value.explicit === 'boolean' && (!['move', 'lay_mines', 'sweep'].includes(value.type) || point(value)) && (value.type !== 'attack' || string(value.targetId, 128)) && (value.temporaryManualHold === undefined || typeof value.temporaryManualHold === 'boolean') && (value.arrived === undefined || typeof value.arrived === 'boolean');
   const ships = array(state.ships, 256, 'ships'); check(ships.length > 0, 'fleet is empty');
   for (const ship of ships) {
     check(object(ship), 'invalid ship'); unique(ship.id, 'ship'); shipIds.add(ship.id);
     const canonical = Object.hasOwn(SHIP_CLASSES[config.era], ship.classId) ? SHIP_CLASSES[config.era][ship.classId] : null;
     check(canonical && object(ship.classData) && ship.classData.id === ship.classId && ship.classData.era === config.era && ship.classData.role === canonical.role, 'invalid ship class');
     check(side(ship.side) && string(ship.name, 160) && point(ship), 'invalid ship identity or coordinates');
-    check(number(ship.heading, -Math.PI - .0001, Math.PI + .0001) && number(ship.speed, 0, 1) && number(ship.maxSpeed, .00001, 1), 'invalid ship motion');
+    check(number(ship.heading, -Math.PI - .0001, Math.PI + .0001) && number(ship.speed, 0, 1) && number(ship.maxSpeed, canonical.role === 'coastal' ? 0 : .00001, 1), 'invalid ship motion');
     check(number(ship.maxHp, 1, 1e7) && number(ship.hp, 0, ship.maxHp) && ['active', 'sinking', 'sunk'].includes(ship.status), 'invalid ship health or status');
     check((ship.status !== 'active' || ship.hp > 0) && (ship.status === 'active' || ship.speed === 0), 'ship status conflicts with physical state');
     check(number(ship.sinkTimer, 0, 3600) && (ship.sinkDuration === undefined || number(ship.sinkDuration, 1, 3600)), 'invalid sinking clock');
+    const depth = depthProfile({classData: canonical});
+    const depthFields = ['depthMeters', 'orderedDepthMeters', 'verticalSpeed', 'depthBlocked', 'depthOrderExplicit', 'depthDecisionAt'];
+    if (depthFields.every(field => !Object.hasOwn(ship, field))) {
+      Object.assign(ship, {depthMeters: depth.defaultDepthMeters, orderedDepthMeters: depth.defaultDepthMeters, verticalSpeed: 0, depthBlocked: false, depthOrderExplicit: false, depthDecisionAt: 0});
+    }
+    check(number(ship.depthMeters, 0, depth.maxDepthMeters) && number(ship.orderedDepthMeters, 0, depth.maxDepthMeters) && number(ship.verticalSpeed, -depth.maxVerticalSpeed, depth.maxVerticalSpeed), 'invalid submarine depth or vertical inertia');
+    check(typeof ship.depthBlocked === 'boolean' && typeof ship.depthOrderExplicit === 'boolean' && number(ship.depthDecisionAt, 0, 1e9), 'invalid submarine depth control state');
+    check(ship.status === 'active' || ship.verticalSpeed === 0, 'inactive ship has vertical motion');
+    check(canonical.role === 'submarine' || !ship.depthBlocked && !ship.depthOrderExplicit && ship.depthDecisionAt === 0, 'surface ship has submarine depth controls');
     for (const field of ['hp', 'speed', 'turnRate', 'armor', 'radar', 'sonar', 'visual', 'signature', 'tonnage']) check(number(ship.classData[field], 0, 1e7), 'invalid class parameter ' + field);
     check(Array.isArray(ship.classData.weapons) && ship.classData.weapons.length === canonical.weapons.length && ship.classData.weapons.every((m, i) => object(m) && m.weaponId === canonical.weapons[i].weaponId), 'invalid class armament');
     check(ship.formationSpeed == null || number(ship.formationSpeed, 0, 1), 'invalid formation pace');
@@ -1053,7 +1273,29 @@ function validateSnapshot(data) {
     for (const field of ['radar', 'sonar', 'visual', 'commRange']) check(number(ship[field], 0, 2000), 'invalid ship sensor or communications range');
     check(typeof ship.manual === 'boolean' && typeof ship.emcon === 'boolean' && typeof ship.convoy === 'boolean' && typeof ship.evacuated === 'boolean', 'invalid ship control flags');
     check(['balanced', 'aggressive', 'conserve'].includes(ship.stance) && ['line', 'column', 'wedge', 'screen'].includes(ship.formation), 'invalid stance or formation');
+    if (canonical.role === 'coastal') check(ship.maxSpeed === 0 && ship.speed === 0 && point(ship.shorePoint) && geometry._onLand(ship) && geometry._segmentClear(ship.shorePoint, ship.shorePoint, .2), 'invalid coastal emplacement');
+    ship.mineAmmo ??= canonical.mineCapacity || 0; ship.mineActionAt ??= 0; ship.mineSweepProgress ??= 0; ship.mineSweepTargetId ??= null;
+    check(integer(ship.mineAmmo, 0, canonical.mineCapacity || 0) && number(ship.mineActionAt) && number(ship.mineSweepProgress, 0, canonical.mineSweepSeconds || 0) && reference(ship.mineSweepTargetId), 'invalid mine warfare inventory or clock');
+    check(ship.mineDeployments === undefined || integer(ship.mineDeployments, 0, 10000), 'invalid mine deployment count');
     check(order(ship.order) && (ship.orderBeforeManual == null || order(ship.orderBeforeManual)), 'invalid ship orders');
+    for (const queued of [ship.order, ship.orderBeforeManual].filter(Boolean)) {
+      if (queued.type === 'lay_mines') check(canonical.role === 'minelayer' && array(queued.points, 8, 'mine-laying route').length > 0 && queued.points.every(p => point(p) && geometry._segmentClear(p, p, .25)) && integer(queued.laid, 0, queued.points.length - 1) && queued.x === queued.points[queued.laid].x && queued.y === queued.points[queued.laid].y, 'invalid mine-laying order');
+      if (queued.type === 'sweep') check(canonical.role === 'minesweeper' && geometry._segmentClear(queued, queued, .25), 'invalid mine clearance order');
+    }
+    ship.collisionContacts ??= {};
+    check(object(ship.collisionContacts) && Object.keys(ship.collisionContacts).length <= 256 && Object.entries(ship.collisionContacts).every(([id, time]) => string(id, 128) && number(time)), 'invalid collision contact state');
+    ship.turnVelocity ??= 0; ship.contactRecoverySpeed ??= 0; ship.avoidance ??= null;
+    ship.stationNavigation ??= null; ship.stationResponseKey ??= null; ship.stationResponseAt ??= 0;
+    check(number(ship.turnVelocity, -.1, .1) && number(ship.contactRecoverySpeed, 0, 1), 'invalid navigation inertia');
+    check(ship.stationNavigation === null || point(ship.stationNavigation), 'invalid local station target');
+    check(ship.stationResponseKey === null || string(ship.stationResponseKey, 512), 'invalid station response');
+    check(number(ship.stationResponseAt), 'invalid station response clock');
+    check(ship.avoidance === null || point(ship.avoidance) && reference(ship.avoidance.otherId) && number(ship.avoidance.course, -Math.PI - .0001, Math.PI + .0001), 'invalid avoidance course');
+    // Migrate old selection-created holds once, when loading the old save.
+    if (ship.order.temporaryManualHold) {
+      ship.order = ship.orderBeforeManual ? clone(ship.orderBeforeManual) : {type: 'auto', explicit: false};
+      ship.orderBeforeManual = null;
+    }
     check(ship.navigation === null || point(ship.navigation), 'invalid navigation target');
     check(ship.pathTarget === null || point(ship.pathTarget), 'invalid route target');
     check(array(ship.path, 4096, 'route').every(p => point(p)), 'invalid route coordinates');
@@ -1080,6 +1322,17 @@ function validateSnapshot(data) {
   }
   check(data.singleManualId === null || shipIds.has(data.singleManualId), 'manual ship does not exist');
   for (const ship of ships) check(ship.manual === (ship.id === data.singleManualId) && (!ship.manual || ship.side === 'blue' && ship.status === 'active'), 'inconsistent manual control state');
+  for (const mine of array(state.mines, 4096, 'mines')) {
+    check(object(mine), 'invalid mine'); unique(mine.id, 'mine');
+    const source = ships.find(ship => ship.id === mine.sourceId), weapon = MINE_TYPES[mine.weaponId];
+    check(weapon && weapon.era === config.era && side(mine.side) && source && source.side === mine.side && source.classData.role === 'minelayer', 'invalid mine source or era');
+    check(point(mine) && geometry._segmentClear(mine, mine, .25) && mine.status === 'active' && number(mine.armedAt), 'invalid mine location or arming clock');
+    check(object(mine.detectedBy) && typeof mine.detectedBy.blue === 'boolean' && typeof mine.detectedBy.red === 'boolean' && mine.detectedBy[mine.side], 'invalid mine visibility');
+  }
+  for (const ship of ships) {
+    check(state.mines.filter(mine => mine.sourceId === ship.id).length + ship.mineAmmo <= (ship.classData.mineCapacity || 0), 'mine inventory exceeds original capacity');
+    check(ship.mineSweepTargetId == null || state.mines.some(mine => mine.id === ship.mineSweepTargetId && mine.side !== ship.side && mine.detectedBy[ship.side]), 'invalid mine sweep reference');
+  }
   for (const p of array(state.projectiles, 8192, 'projectiles')) {
     check(object(p), 'invalid projectile'); unique(p.id, 'projectile');
     const weapon = WEAPONS[p.weaponId];

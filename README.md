@@ -1,5 +1,7 @@
 # PELAGIC - Browser Edition
 
+Version 1.4.0: submarine depth controls, depth-aware combat and AI, inertial navigation and hull collisions, natural terrain, mines and coastal defenses.
+
 A single-player naval command game. All simulation runs in the browser.
 No server runtime, package installation or build step is required on GitHub Pages.
 Desktop keyboard and mouse controls are recommended.
@@ -17,6 +19,9 @@ address is https://yhztdli.github.io/pelagic/ .
 Deploy fleet starts paused. Space starts/pauses; choose 1x through 60x manually.
 Drag to select, right-click to command, scroll to zoom, and Home to fit the chart.
 Select one ship for full manual offense AND defense control.
+Select a submarine and use Submarine depth > Target depth (m) > Apply; 0 means surfaced.
+Depth changes gradually and player depth orders persist. Weapon cards show launch restrictions.
+
 Save in browser stores one campaign in IndexedDB for this site's URL path.
 Load browser save restores it after reload or a normal browser restart.
 Download save exports a JSON backup; Import save file accepts compatible desktop

@@ -3383,6 +3383,29 @@ export const SHIP_CLASSES = {
   }
 };
 
+// Aimed offensive cycles are deliberately separated from real projectile and hull speeds.
+for (const weapon of Object.values(WEAPONS)) {
+  if (!['gun', 'missile', 'torpedo', 'depthcharge', 'aircraft'].includes(weapon.kind)) continue;
+  weapon.cooldown = Math.round(weapon.cooldown * 1.15 * 100) / 100;
+  if (weapon.engagementCycle) weapon.engagementCycle = Math.round(weapon.engagementCycle * 1.15);
+  if (weapon.salvoInterval) weapon.salvoInterval = Math.max(weapon.cooldown, Math.round(weapon.salvoInterval * 1.15 * 100) / 100);
+  weapon.acquisitionTime = Math.round((weapon.kind === 'gun' ? (weapon.era === 'modern' ? 8 : 12) : weapon.kind === 'torpedo' ? 35 : weapon.kind === 'aircraft' ? 45 : 25) * 1.2);
+}
+
+// Mine stores are handled by laying orders, never by targetless weapon fire.
+export const MINE_TYPES = {
+  modern: {id: 'modern', era: 'modern', name: 'Influence mine', kind: 'mine', damage: 520, triggerRadius: .24, armingDelay: 60},
+  ww2: {id: 'ww2', era: 'ww2', name: 'Moored contact mine', kind: 'mine', damage: 380, triggerRadius: .18, armingDelay: 75}
+};
+for (const era of ['modern', 'ww2']) {
+  const classes = SHIP_CLASSES[era], modern = era === 'modern';
+  const mount = (weaponId, ammo) => ({weaponId, ammo, capacity: ammo});
+  const common = {era, armor: .04, turnRate: .8, radar: modern ? 22 : 8, sonar: modern ? 5 : 2, visual: 15, signature: .4, crew: 80, lengthMeters: 80, beamMeters: 12};
+  classes.minelayer = {...common, id: 'minelayer', name: modern ? 'Shoal-class mine warfare tender' : 'Stonebank-class coastal minelayer', shortName: 'Minelayer', role: 'minelayer', hp: modern ? 720 : 620, speed: modern ? 19 : 18, tonnage: 1800, mineCapacity: modern ? 32 : 40, weapons: [mount(modern ? 'gun_76' : 'ww2_gun_102', 160), mount(modern ? 'ciws_20' : 'ww2_aa_20', 80)], description: 'Lays finite defensive mine stores before departure or along an ordered route. Friendly charts prevent own-side mine strikes.'};
+  classes.minesweeper = {...common, id: 'minesweeper', name: modern ? 'Clearwater-class mine countermeasures ship' : 'Harborlight-class fleet minesweeper', shortName: 'Minesweeper', role: 'minesweeper', hp: modern ? 460 : 420, speed: modern ? 15 : 14, tonnage: 950, lengthMeters: 64, beamMeters: 10, mineDetectionRange: modern ? 2.4 : 1.2, mineSweepRange: modern ? .65 : .4, mineSweepSeconds: modern ? 36 : 50, weapons: [mount(modern ? 'gun_57' : 'ww2_gun_102', 140), mount(modern ? 'ciws_20' : 'ww2_aa_20', 60)], description: modern ? 'Specialized mine sonar and remotely operated clearance equipment detect and clear nearby mine contacts.' : 'Lookouts and mechanical sweeping gear locate and cut moored mines along a slow clearance route.'};
+  classes.coastal_battery = {...common, id: 'coastal_battery', name: modern ? 'Headland coastal missile and gun battery' : 'Headland coastal artillery battery', shortName: 'Coastal Battery', role: 'coastal', hp: modern ? 1500 : 1700, armor: .35, speed: 0, radar: modern ? 36 : 16, sonar: 0, visual: modern ? 25 : 20, signature: .8, tonnage: 1500, lengthMeters: 90, beamMeters: 20, weapons: modern ? [mount('asm_coastal', 16), mount('gun_127', 240), mount('sam_short', 16)] : [mount('ww2_gun_152', 260), mount('ww2_aa_40', 160)], description: 'An immobile shore installation covering sea approaches. Surface and land-attack weapons can engage it; underwater weapons cannot.'};
+}
+
 export const MAPS = [
   {
     "id": "open_ocean",
@@ -4714,18 +4737,21 @@ if(era==='ww2'&&faction.doctrine==='carrier'&&faction.tier===1&&seed%2===0)fleet
 if(scale==='large'&&faction.doctrine==='carrier'&&faction.tier<=2)fleet[fleet.length-2]='light_carrier';
 if(scale==='large'&&faction.doctrine==='balanced')fleet[fleet.length-2]=era==='modern'?(faction.tier<=3?'amphibious':'landing_ship'):'amphibious';
 if(faction.tier===5&&faction.doctrine!=='submarine'){const i=fleet.findIndex((id,i)=>i>0&&SHIP_CLASSES[era][id].role==='corvette');if(i>=0)fleet[i]='patrol';}
+// Guarantee practical mine warfare access without changing fleet size or its capital ships.
+const supportSlots=fleet.map((id,i)=>({id,i})).filter(({id})=>!['carrier','battleship','supply','amphibious'].includes(SHIP_CLASSES[era][id].role)&&!SHIP_CLASSES[era][id].weapons.some(m=>['air_asw','ww2_air_asw'].includes(m.weaponId))).slice(-2);
+if(supportSlots.length===2){fleet[supportSlots[0].i]='minelayer';fleet[supportSlots[1].i]='minesweeper';}
 return fleet;
 }
 function pointInPolygon(point,points){let inside=false;for(let i=0,j=points.length-1;i<points.length;j=i++){const a=points[i],b=points[j];if((a[1]>point.y)!==(b[1]>point.y)&&point.x<(b[0]-a[0])*(point.y-a[1])/(b[1]-a[1])+a[0])inside=!inside;}return inside;}
 export function validateCatalog(){
 const errors=[],check=(ok,msg)=>{if(!ok)errors.push(msg);},finite=(v,a,b=Infinity)=>Number.isFinite(v)&&v>=a&&v<=b;
-const roles=['carrier','battleship','cruiser','destroyer','frigate','corvette','submarine','amphibious','supply','patrol'];
+const roles=['carrier','battleship','cruiser','destroyer','frigate','corvette','submarine','amphibious','supply','patrol','minelayer','minesweeper','coastal'];
 const kinds=['missile','sam','gun','ciws','torpedo','depthcharge','aircraft','aa'],targets=['surface','submarine','air','projectile','objective'];
 check(FACTIONS.length===64,'Expected 64 factions');check(new Set(FACTIONS.map(f=>f.id)).size===FACTIONS.length,'Duplicate faction ID');check(new Set(FACTIONS.map(f=>f.name)).size===FACTIONS.length,'Duplicate faction name');
 for(const f of FACTIONS){check(Number.isInteger(f.tier)&&finite(f.tier,1,5),`${f.id}:invalid tier`);check(finite(f.tech,.7,1.25)&&finite(f.fleetScale,.65,1.4),`${f.id}:multiplier out of bounds`);check(Object.hasOwn(recipes.modern,f.doctrine),`${f.id}:invalid doctrine`);check(Boolean(f.name&&f.description&&f.color),`${f.id}:missing faction details`);}
 for(const [id,v] of Object.entries(WEAPONS)){check(v.id===id&&kinds.includes(v.kind),`${id}:invalid weapon ID or kind`);check(['modern','ww2','both'].includes(v.era),`${id}:invalid era`);check(finite(v.range,.01)&&finite(v.minRange,0,v.range),`${id}:invalid range`);check(finite(v.speed,.0001,2)&&finite(v.damage,0)&&finite(v.cooldown,.01),`${id}:invalid motion or damage parameters`);check(finite(v.accuracy,0,1)&&finite(v.cost,0),`${id}:invalid accuracy or cost`);check(v.targets.length>0&&v.targets.every(t=>targets.includes(t)),`${id}:invalid target type`);check(v.era!=='ww2'||!['missile','sam','ciws'].includes(v.kind),`${id}:anachronistic WWII weapon`);}
 for(const era of ERAS){const classes=SHIP_CLASSES[era.id];for(const role of roles)check(Object.values(classes).some(s=>s.role===role),`${era.id}:missing${role}`);
-for(const [id,s] of Object.entries(classes)){check(id===s.id&&s.era===era.id&&roles.includes(s.role),`${era.id}/${id}:invalid identity`);check(finite(s.hp,1)&&finite(s.armor,0,.8)&&finite(s.speed,1,50)&&finite(s.turnRate,.01,5),`${era.id}/${id}:invalid hull parameters`);check(finite(s.radar,0,100)&&finite(s.sonar,0,100)&&finite(s.visual,0,50)&&finite(s.signature,0,1),`${era.id}/${id}:invalid sensor parameters`);check(finite(s.tonnage,1)&&Number.isInteger(s.crew)&&s.crew>0,`${era.id}/${id}:invalid displacement or complement`);check(era.id!=='ww2'||s.radar<=30,`${era.id}/${id}:anachronistic radar range`);
+for(const [id,s] of Object.entries(classes)){check(id===s.id&&s.era===era.id&&roles.includes(s.role),`${era.id}/${id}:invalid identity`);check(finite(s.hp,1)&&finite(s.armor,0,.8)&&finite(s.speed,s.role==='coastal'?0:1,50)&&finite(s.turnRate,.01,5),`${era.id}/${id}:invalid hull parameters`);check(finite(s.radar,0,100)&&finite(s.sonar,0,100)&&finite(s.visual,0,50)&&finite(s.signature,0,1),`${era.id}/${id}:invalid sensor parameters`);check(finite(s.tonnage,1)&&Number.isInteger(s.crew)&&s.crew>0,`${era.id}/${id}:invalid displacement or complement`);check(era.id!=='ww2'||s.radar<=30,`${era.id}/${id}:anachronistic radar range`);
 for(const mt of s.weapons){const v=WEAPONS[mt.weaponId];check(Boolean(v),`${era.id}/${id}:unknown weapon${mt.weaponId}`);check(!v||v.era===era.id||v.era==='both',`${era.id}/${id}:anachronistic loadout`);check(Number.isInteger(mt.ammo)&&Number.isInteger(mt.capacity)&&mt.ammo>=0&&mt.ammo<=mt.capacity&&mt.capacity>0,`${era.id}/${id}:invalid ammunition`);}}
 for(const f of FACTIONS)for(const scale of ['small','standard','large']){try{const fleet=createFleet(era.id,f.id,'blue',scale),[min,max]=scale==='small'?[5,8]:scale==='large'?[18,28]:[8,16];check(fleet.length>=min&&fleet.length<=max,`${era.id}/${f.id}/${scale}:invalid fleet size`);check(fleet.every(id=>classes[id]),`${era.id}/${f.id}/${scale}:unknown ship class`);check(JSON.stringify(fleet)===JSON.stringify(createFleet(era.id,f.id,'red',scale)),`${era.id}/${f.id}:mirrored fleets differ`);}catch(e){errors.push(`${era.id}/${f.id}:${e.message}`);}}}
 check(MAPS.length>=10&&new Set(MAPS.map(m=>m.id)).size===MAPS.length,'Insufficient maps or duplicate map ID');
